@@ -1,0 +1,21 @@
+# Python 3.10+
+
+# Platform
+fluxer.py[voice]==0.4.2      # pinned: every binding was verified against 0.4.2.
+                             # [voice] pulls in livekit and needs ffmpeg on PATH;
+                             # without it, radio and music are simply off.
+
+# Data sources
+httpx                        # the model, weather, radio, quotes, animals
+yt-dlp                       # music playback
+skyfield                     # moon phases (needs de421.bsp, see README)
+google-api-python-client     # image search (optional)
+
+# Media
+Pillow                       # welcome cards and image handling
+matplotlib                   # font discovery for the welcome card only
+
+python-dotenv
+
+# Only for tools/build_gill_db.py (optional bible commentary):
+# beautifulsoup4
