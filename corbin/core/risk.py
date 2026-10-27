@@ -24,7 +24,7 @@ from enum import Enum
 from typing import AbstractSet, Any, Mapping, Optional, Sequence
 
 from .context import Member, Surface
-from .permissions import Perm, STAFF_PERMS, has
+from .permissions import Perm, STAFF_PERMS, has, is_staff_permission
 from .registry import BASE_THRESHOLD, CommandSpec, Risk
 
 #: Confidence can never be required above/below these, so a pile of modifiers
@@ -209,10 +209,20 @@ def assess(
     target: Optional[TargetProfile] = None,
     is_bot_owner: bool = False,
     grants: "AbstractSet[str]" = frozenset(),
+    spoken: bool = False,
+    features: "AbstractSet[str]" = frozenset(),
+    in_guild: bool = True,
 ) -> Assessment:
     """Decide whether to execute, confirm, refuse, or converse.
 
     Hard gates run first and are never overridden by confidence.
+
+    ``spoken``: the words came from speech recognition in voice chat.
+    ``features``: what the owner's allowlist turns on in this server
+    (``core.features``); a command with a ``feature`` outside it is
+    refused.
+    ``in_guild``: False in a DM, where a ``guild_only`` command is
+    refused.
     """
     def verdict(decision: Decision, reason: str, *,
                 threshold: float = 0.0, base: float = 0.0,
@@ -235,8 +245,39 @@ def assess(
     if spec.owner_only and not is_bot_owner:
         return verdict(Decision.DENIED, "owner-only command")
 
-    # The bot owner bypasses guild permissions, matching the Discord build's
-    # `guild_permissions.administrator or user.id == OWNER` pattern.
+    # Server-only commands in a DM. ``guild_only`` used to be read only
+    # by the help, so nothing stopped "play lofi" or "put the radio on"
+    # in a DM: music and radio find the caller's voice channel from their
+    # voice state in ANY server, and would join it with no guild behind
+    # the command. The owner isn't exempt; there's no server to act in.
+    if spec.guild_only and not in_guild:
+        return verdict(Decision.REFUSED,
+                       "That only works in a server, not in DMs")
+
+    # The owner's per-server allowlist. Default deny, and the owner is
+    # not exempt: the allowlist is how he turns a server on. The reason
+    # is shown as-is and doesn't say who can turn it on, so nobody DMs
+    # him trying to talk him into it.
+    if spec.feature and spec.feature not in features:
+        from .features import label
+
+        return verdict(Decision.REFUSED,
+                       f"{label(spec.feature)} isn't turned on for this "
+                       "server")
+
+    # Speech recognition is lossy input. Nothing a staff member or the
+    # owner would need, and nothing destructive, runs from voice -- not
+    # even after a spoken "yes", which is just as easy to mishear. A
+    # misheard "ban" must never act. Not overridable by confidence.
+    if spoken and (spec.owner_only or spec.risk is Risk.DESTRUCTIVE
+                   or is_staff_permission(spec.permission)):
+        return verdict(Decision.REFUSED,
+                       "I won't do that from voice. Type it in chat")
+
+    # The bot owner has NO bypass here: in someone else's server they need
+    # that server's permissions like anyone else. Being the bot owner only
+    # unlocks ``owner_only`` commands (hard gate 2), which act on the bot
+    # itself, never on a server or its members.
     #
     # ``grants`` names commands this particular invoker may run without
     # the guild permission -- a deliberate, per-person, per-command
@@ -252,8 +293,7 @@ def assess(
         spec.name in grants
         or spec.name.replace("-", "_") in grants
         or spec.name.replace("_", "-") in grants)
-    if not is_bot_owner and not granted and not has(effective,
-                                                    spec.permission):
+    if not granted and not has(effective, spec.permission):
         from .permissions import missing as missing_perms
 
         return verdict(
@@ -273,8 +313,7 @@ def assess(
         # Discord/Fluxer only enforce hierarchy for the *bot*, not the
         # invoker, so Corbin enforces it himself.
         if (
-            not is_bot_owner
-            and not invoker.is_guild_owner
+            not invoker.is_guild_owner
             and target.top_role_position >= invoker.top_role_position
         ):
             return verdict(
@@ -325,6 +364,12 @@ def assess(
                 Decision.CONFIRM, "no reason was given",
                 threshold=threshold, base=base, adjustments=adjustments,
             )
+
+    if spec.always_confirm:
+        return verdict(
+            Decision.CONFIRM, "this command always confirms",
+            threshold=threshold, base=base, adjustments=adjustments,
+        )
 
     if confidence >= threshold:
         return verdict(

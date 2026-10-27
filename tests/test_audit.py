@@ -13,7 +13,7 @@ from corbin.core.settings import ChatSettings
 
 def _m(mid, cid="c", content="hello"):
     return CachedMessage(id=mid, channel_id=cid, author_id="u",
-                         author_name="Sam", content=content)
+                         author_name="Lux", content=content)
 
 
 def suite_cache(r: Results) -> None:

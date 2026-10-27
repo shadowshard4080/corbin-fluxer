@@ -28,9 +28,12 @@ import re
 import time
 from typing import Any, Awaitable, Callable, Optional, Sequence
 
+from corbin.core.link_previews import render_inline
+
 from ..identity import NAME as BOT_NAME
 
 from .json_utils import extract_json_object  # noqa: F401  (kept for parity)
+from ..core.logtext import said
 
 logger = logging.getLogger("corbin.presence")
 
@@ -99,6 +102,25 @@ def presence_window(entries: Sequence[dict],
     return fresh or recent
 
 
+def _body(entry: dict, max_len: Optional[int] = None, *,
+          previews: bool = False) -> str:
+    """One transcript line's text, naming any media he cannot see.
+
+    Without the labels an image-only post was an empty line, and a bare
+    link gave him nothing but a URL, so he made up what was in it.
+    ``previews`` adds what a link shows; only the generator asks for it,
+    since the gate deciding *whether* to speak shouldn't be swayed by it.
+    """
+    body = str(entry.get("content") or "")
+    if max_len is not None:
+        body = body[:max_len]
+    for label in entry.get("media") or ():
+        body += f" [posted {label}, which you cannot see]"
+    if previews:
+        body += render_inline(entry.get("previews") or ())
+    return body.strip()
+
+
 def numbered_transcript(entries: Sequence[dict], *,
                         limit: int = EVAL_MESSAGES,
                         max_len: int = EVAL_CONTENT_LEN
@@ -106,7 +128,7 @@ def numbered_transcript(entries: Sequence[dict], *,
     picked = list(entries)[-limit:]
     lines = []
     for index, entry in enumerate(picked, start=1):
-        body = str(entry.get("content") or "")[:max_len]
+        body = _body(entry, max_len)
         who = entry.get("author") or "someone"
         lines.append(f"#{index} [{who}]: {body}")
     return "\n".join(lines), picked
@@ -188,6 +210,8 @@ class PresenceEngine:
         #: Optional ``musings.Musings``; set after construction because the
         #: search pipeline it uses is built later.
         self.musings = musings
+        #: guild -> the last reason logged for a due musing waiting.
+        self._musing_waiting: dict[str, str] = {}
         self._task: Optional[asyncio.Task] = None
 
     # -- bookkeeping ------------------------------------------------------
@@ -269,8 +293,15 @@ class PresenceEngine:
                     continue
                 general = self.musings.general_channel(guild_id)
                 if general:
-                    if (not self._is_enabled(guild_id, general)
-                            or self.on_cooldown(guild_id, general)):
+                    if not self._is_enabled(guild_id, general):
+                        self._musing_waits(
+                            guild_id, f"the general chat {general} doesn't "
+                            "allow chiming in (mode not global, or "
+                            "silenced/presence off there)")
+                        continue
+                    if self.on_cooldown(guild_id, general):
+                        self._musing_waits(guild_id, f"the general chat "
+                                           f"{general} is on cooldown")
                         continue
                     # Activity anywhere counts: people are around, and
                     # the general chat may be the quiet one.
@@ -286,7 +317,10 @@ class PresenceEngine:
                 channel_id = pick_channel(candidates, self._last_message_at,
                                           now, general=general)
                 if channel_id is None:
-                    continue  # the slot waits for a channel to be ready
+                    # The slot waits for a channel to be ready.
+                    self._musing_waits(guild_id, self._musing_wait_reason(
+                        candidates, now, general))
+                    continue
                 composed = await self.musings.compose(guild_id, channel_id)
                 if not composed:
                     planner.consume(guild_id)
@@ -296,11 +330,36 @@ class PresenceEngine:
                 self.mark_spoke(guild_id, channel_id)
                 planner.consume(guild_id, topic)
                 posted += 1
-                logger.info("Musing in %s | topic=%s | sent=%s", channel_id,
+                self._musing_waiting.pop(guild_id, None)
+                logger.info("Musing in %s | topic=%s | sent=%s", channel_id,  # log-ok: his own musing
                             topic, text[:200])
             except Exception:
                 logger.exception("musing failed for guild %s", guild_id)
         return posted
+
+    def _musing_waits(self, guild_id: str, why: str) -> None:
+        """Log why a due musing is held back, once per change of reason.
+        Every gate here used to be a silent ``continue``: "3 planned" and
+        then nothing, with no way to tell which gate held them."""
+        if self._musing_waiting.get(guild_id) != why:
+            self._musing_waiting[guild_id] = why
+            logger.info("musing for guild %s is due but waiting: %s",
+                        guild_id, why)
+
+    def _musing_wait_reason(self, candidates, now: float,
+                            general: Optional[str]) -> str:
+        from .musings import ACTIVE_WITHIN, QUIET_FOR
+        if not candidates:
+            return ("no channel he may post in (presence allowed, not "
+                    "always-on) has had a human message since the restart")
+        active = max(ts for _, ts in candidates)
+        if now - active > ACTIVE_WITHIN:
+            return (f"nobody has talked here for {int((now - active) / 60)}"
+                    f" min (needs someone within "
+                    f"{int(ACTIVE_WITHIN / 3600)} h)")
+        target = general or max(candidates, key=lambda c: c[1])[0]
+        return (f"channel {target} was active in the last "
+                f"{int(QUIET_FOR / 60)} min")
 
     def _last_message_at(self, channel_id: str) -> Optional[float]:
         entries = self.conversation.entries(channel_id)
@@ -338,7 +397,7 @@ class PresenceEngine:
         await self._send(channel_id, text, final)
         self.mark_spoke(guild_id, channel_id)
         logger.info("Presence response in %s | reason=%s | sent=%s",
-                    channel_id, reason[:120], text[:200])
+                    channel_id, said(reason, 120), said(text, 200))
         return True
 
     # -- model calls ------------------------------------------------------
@@ -355,7 +414,7 @@ class PresenceEngine:
                 messages=[{"role": "user", "content": transcript}],
                 # 0.0 gave a borderline channel the same PASS on every
                 # sweep, forever.
-                max_tokens=EVAL_MAX_TOKENS, temperature=0.7,
+                max_tokens=EVAL_MAX_TOKENS, temperature=0.7, structured=True,
             )
         except Exception:
             logger.exception("presence evaluation failed")
@@ -368,7 +427,8 @@ class PresenceEngine:
         for entry in window:
             mark = ("   <<< YOU ARE REPLYING TO THIS MESSAGE"
                     if entry is target else "")
-            lines.append(f"[{entry['author']}]: {entry['content']}{mark}")
+            lines.append(
+                f"[{entry['author']}]: {_body(entry, previews=True)}{mark}")
         addressee = target.get("author") or "them"
 
         prompt = (
@@ -379,10 +439,17 @@ class PresenceEngine:
             f"Reply to {addressee}, to the marked message. One or two "
             "sentences, the way a person types in chat. Do not greet anyone, "
             "do not summarise the conversation, do not offer help, and do "
-            "not announce that you are joining in. Just say the thing."
+            "not announce that you are joining in. Just say the thing. "
+            "You cannot open links or see images. A [link preview: ...] is "
+            "what that link shows, and all you know of it. A link with no "
+            "preview, or a [posted ...] note, is just the URL or a name: "
+            "react to what people said about it, never to what you imagine "
+            "it shows."
         )
         constants = self.llm.constants
-        soul = getattr(self.conversation, "soul", "") or None
+        build = getattr(self.conversation, "standalone_system", None)
+        soul = (build() if callable(build)
+                else getattr(self.conversation, "soul", "")) or None
         try:
             result = await self.llm.call(
                 model=constants.MODEL_MAIN, system=soul,

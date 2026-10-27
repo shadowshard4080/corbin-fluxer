@@ -114,12 +114,28 @@ AI_CHANNELS = {c.strip() for c in _get("AI_CHANNELS").split(",")
 #: Request GUILD_PRESENCES. Off by default: a gateway that rejects an
 #: unauthorised intent refuses IDENTIFY and the bot fails to start.
 PRESENCE_INTENT = _flag("PRESENCE_INTENT", False)
-LOG_LEVEL = _get("LOG_LEVEL", default="INFO").upper()
+LOG_LEVEL = _get("LOG_LEVEL", "CORBIN_LOG_LEVEL", default="INFO").upper()
+#: The log file, rotated at midnight (UTC) and kept LOG_DAYS days. Logs
+#: can hold message text and user ids, so keep the retention short.
+#: Set LOG_FILE= (empty) for stderr only.
+LOG_FILE = (str(_path("LOG_FILE", HERE / "logs" / "bot.log"))
+            if os.environ.get("LOG_FILE", None) != "" else "")
+LOG_DAYS = int(_get("LOG_DAYS", default="14") or 14)
 
 # --- State ----------------------------------------------------------------
 #: Memories, XP, reminders, bans, settings. Created on first write.
 DATA_ROOT = str(_path("DATA_ROOT", HERE / "data"))
 SETTINGS_PATH = _path("SETTINGS_PATH", Path(DATA_ROOT) / "chat_settings.json")
+
+#: Encryption at rest for memories, warnings and reminders
+#: (corbin/core/crypto.py). Needs `pip install cryptography`. Make a key
+#: with `python tools/encrypt_data.py --new-key` and keep a copy somewhere
+#: safe: without it that data is unreadable. Better than DATA_KEY itself:
+#: DATA_KEY_FILE, a file OUTSIDE this folder (chmod 600), so a copy or
+#: backup of the bot's folder doesn't carry the key with the data. Both
+#: empty: plain JSON, as before.
+DATA_KEY = _get("DATA_KEY", "CORBIN_DATA_KEY")
+DATA_KEY_FILE = _get("DATA_KEY_FILE", "CORBIN_DATA_KEY_FILE")
 
 # --- Optional integrations (each feature is off when its key is unset) ----
 WEATHER_API_KEY = _get("WEATHER_API_KEY")          # openweathermap.org
@@ -136,6 +152,81 @@ EPHEMERIS_PATH = _get("EPHEMERIS_PATH")
 #: John Gill's Exposition for bible-verse commentary, built by
 #: tools/build_gill_db.py. Missing: NET translators' notes are used instead.
 GILL_DB_PATH = _path("GILL_DB_PATH", Path(DATA_ROOT) / "gill_commentary.sqlite")
+
+
+# --- Streaming video (screen share) -----------------------------------------
+# All of it needs the voice extra and ffmpeg, and a server the owner has
+# allowlisted for "streaming" (DM the bot: "add <server id> to the
+# allowlist for streaming"). Nothing streams anywhere until then.
+#: Live TV catalogue from iptv-org: a daily download plus a background
+#: health check of every stream. Idle while no server allows streaming.
+#: 0 turns it off.
+IPTV_ENABLED = _flag("IPTV", True)
+#: The small "12:34 / 24:02" in the corner of music videos and local
+#: videos. 0 turns it off. It also turns itself off, with a warning, if
+#: this ffmpeg can't draw text.
+STREAM_TIMER = _flag("STREAM_TIMER", True)
+#: The local video library: one folder per show, seasons in subfolders, a
+#: video straight in the folder is a film. Read on every request; missing
+#: means no videos.
+VIDEO_ROOT = _path("VIDEO_ROOT", Path(DATA_ROOT) / "video")
+#: Default live TV watch limit in minutes for servers that haven't set
+#: their own. 0 = none.
+TV_MAX_MINUTES = int(_get("TV_MAX_MINUTES", default="0") or 0)
+#: Let servers stream at 1080p30 (6 Mbit/s). A 1080p encode can take a
+#: whole CPU core: leave this off on a small host. Asking for 1080p while
+#: it's off is refused with that reason, never silently downgraded.
+ALLOW_1080P = _flag("ALLOW_1080P", False)
+#: The stream size for servers that haven't picked one: 720p or 1080p.
+#: 1080p needs ALLOW_1080P; without it, it reads as 720p.
+STREAM_QUALITY = _get("STREAM_QUALITY", default="720p")
+
+
+# --- Voice chat (VoiceStudio) ----------------------------------------------
+#: Spoken conversation in voice channels needs VoiceStudio running on this
+#: host (or reachable from it). It is probed at boot and again each time
+#: voice chat is started; when it is down, voice chat says so and stays off.
+VOICE_CHAT = _flag("VOICE_CHAT", True)
+#: First-boot seed for the owner's voice allowlist (comma-separated
+#: server ids). Read only while the allowlist has never been written;
+#: after that, DM the bot to change it ("add <id> to the allowlist for
+#: voice"). Opt-in: empty means nowhere, so adding the bot to a new server
+#: never hands it an open microphone by accident.
+VOICE_CHAT_GUILDS = {g.strip() for g in _get("VOICE_CHAT_GUILDS").split(",")
+                     if g.strip()}
+#: VoiceStudio's service root, without /v1.
+VOICESTUDIO_URL = _get("VOICESTUDIO_URL", default="http://127.0.0.1:3900")
+#: Only for a remote or locked-down backend (its OMNIVOICE_API_KEY).
+VOICESTUDIO_API_KEY = _get("VOICESTUDIO_API_KEY", "OMNIVOICE_API_KEY")
+#: OmniVoice steps per line: 32 is its quality preset, 16 is faster.
+VOICESTUDIO_STEPS = int(_get("VOICESTUDIO_STEPS", default="32") or 32)
+#: Transcribe while people talk, over VoiceStudio's streaming socket,
+#: instead of uploading each utterance after it ends. Off until
+#: tools/check_voicestudio.py shows it's faster and as accurate on your
+#: engine. Any failure falls back to the upload.
+VOICE_STREAM_STT = _flag("VOICE_STREAM_STT", False)
+#: The socket's ?model= (a streaming model id). Empty: VoiceStudio's
+#: default.
+VOICESTUDIO_STT_MODEL = _get("VOICESTUDIO_STT_MODEL")
+#: Barge-in: the person he's answering can cut him off by talking over
+#: him. 0 turns it off (he finishes every line).
+VOICE_BARGE_IN = _flag("VOICE_BARGE_IN", True)
+#: Raven calls spliced in where a spoken reply says *caw*: one audio file,
+#: or a folder of them (a different one each time). Missing or empty: he
+#: says the word instead.
+CAW_SOUNDS = str(_path("CAW_SOUNDS", Path(DATA_ROOT) / "caws"))
+#: Chance (0-1) of a caw after he finishes speaking, on lines that didn't
+#: already have one. Only with recordings. 0 turns it off.
+CAW_CHANCE = float(_get("CAW_CHANCE", default="0.2") or 0)
+#: A voice-profile id or name from VoiceStudio, or "default".
+VOICESTUDIO_VOICE = _get("VOICESTUDIO_VOICE", default="default")
+#: An installed engine id, or "tts-1" for whichever engine is active.
+VOICESTUDIO_TTS_MODEL = _get("VOICESTUDIO_TTS_MODEL", default="tts-1")
+#: Spoken language hint for transcription ("en"). Empty: auto-detect.
+VOICESTUDIO_LANGUAGE = _get("VOICESTUDIO_LANGUAGE")
+#: Effect on his voice: "raven" (the default), "off", or a raw ffmpeg
+#: audio filter chain. See FX_PRESETS in corbin/core/voicechat.py.
+VOICE_FX = _get("VOICE_FX", default="raven")
 
 
 def validate() -> list[str]:
@@ -173,4 +264,12 @@ def summary() -> str:
         f"  data root     : {DATA_ROOT}",
         f"  log channel   : {LOG_CHANNEL_ID or '(none)'}",
         f"  AI channels   : {', '.join(sorted(AI_CHANNELS)) or '(none seeded)'}",
+        f"  log file      : {LOG_FILE or '(stderr only)'}",
+        f"  voice chat    : "
+        f"{('VoiceStudio @ ' + VOICESTUDIO_URL + ', voice ' + VOICESTUDIO_VOICE + ', fx ' + (VOICE_FX or 'off')) if VOICE_CHAT else 'disabled'}",
+        f"  streaming     : live TV {'on' if IPTV_ENABLED else 'off'}, "
+        f"videos {VIDEO_ROOT}"
+        f"{'' if VIDEO_ROOT.is_dir() else ' (missing)'}, "
+        f"default {STREAM_QUALITY if ALLOW_1080P else '720p'}"
+        f"{'' if ALLOW_1080P else ' (1080p not allowed)'}",
     ])

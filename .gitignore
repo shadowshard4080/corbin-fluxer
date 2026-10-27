@@ -5,3 +5,8 @@ __pycache__/
 # Runtime state: memories, XP, settings, bans. Never commit it.
 data/
 cookies.txt
+# Rotated log files (LOG_FILE).
+logs/
+# CORBIN_DATA_KEY_FILE keys and encrypt_data.py backups (plain text).
+*.key
+data-backup-*.tar.gz

@@ -109,6 +109,7 @@ class ChatSettings:
     * ``ai_channels``  -- channels where every message is treated as directed
     * ``mode``         -- "mention" (default) or "global"
     * ``silenced``     -- channels where Corbin stays quiet entirely
+    * ``presence_off`` -- channels where he answers but never chimes in
     * ``general_channel`` -- where unprompted musings go
     """
 
@@ -465,3 +466,39 @@ class ChatSettings:
             channels.discard(str(channel_id))
         self.store.set(guild_id, "silenced", sorted(channels))
         return now_silenced
+
+    def set_silenced(self, guild_id: str | int, channel_id: str,
+                     silenced: bool) -> bool:
+        """Set, not toggle. Returns True if anything changed."""
+        channels = self.silenced(guild_id)
+        before = str(channel_id) in channels
+        if silenced:
+            channels.add(str(channel_id))
+        else:
+            channels.discard(str(channel_id))
+        self.store.set(guild_id, "silenced", sorted(channels))
+        return before != silenced
+
+    # -- per-channel presence opt-out ---------------------------------------
+    # Quieter than silencing: he still answers a mention or a reply here,
+    # he just never chimes in (or muses) on his own.
+
+    def presence_off(self, guild_id: str | int) -> set[str]:
+        return {str(c) for c in self.store.get(guild_id, "presence_off", [])}
+
+    def is_presence_off(self, guild_id: Optional[str], channel_id: str) -> bool:
+        if not guild_id:
+            return False
+        return str(channel_id) in self.presence_off(guild_id)
+
+    def set_presence_off(self, guild_id: str | int, channel_id: str,
+                         off: bool) -> bool:
+        """Returns True if anything changed."""
+        channels = self.presence_off(guild_id)
+        before = str(channel_id) in channels
+        if off:
+            channels.add(str(channel_id))
+        else:
+            channels.discard(str(channel_id))
+        self.store.set(guild_id, "presence_off", sorted(channels))
+        return before != off

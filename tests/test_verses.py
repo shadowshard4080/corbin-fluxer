@@ -6,7 +6,8 @@ logging.getLogger("corbin").setLevel(logging.CRITICAL)
 
 from _harness import Results, run
 
-REPO = None  # the parser is vendored; load() takes no path
+#: This bot's folder (verse parsing and the Gill DB live in it).
+REPO = str(__import__("pathlib").Path(__file__).resolve().parent.parent)
 
 
 def suite_parsing(r: Results) -> None:
@@ -66,7 +67,7 @@ def suite_gill(r: Results) -> None:
             missing.lookup({"book": 43, "chapter": 3, "verse": 16,
                             "end_verse": None}), [])
 
-    real = Path(__file__).resolve().parent.parent / "data" / "gill_commentary.sqlite"
+    real = Path(REPO) / "data" / "gill_commentary.sqlite"
     if not real.exists():
         r.ok("bundled db not present here (skipped)", True)
         return

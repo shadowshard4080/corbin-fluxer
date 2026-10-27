@@ -201,6 +201,25 @@ class CommandSpec:
     #: confirmation prompt. Without it the prompt falls back to a mechanical
     #: "name (arg=value)" form, which reads like a stack trace to a user.
     confirm_phrase: Optional[Callable[[Mapping[str, Any]], str]] = None
+    #: A key from ``core.features.FEATURES`` ("voice", "streaming"). Set,
+    #: the command only runs in servers the bot owner has allowlisted
+    #: for that feature -- checked as a hard gate in ``risk.assess``.
+    feature: Optional[str] = None
+    #: Always ask "Want me to ...? (yes/no)" first, however clear the
+    #: request. For owner changes that are easy to get wrong in a way
+    #: nobody notices (an allowlist entry with a mistyped 18-digit id).
+    always_confirm: bool = False
+    #: A regex the message itself must match (case-insensitive) before the
+    #: AI router may run this command. The classifier sees one message with
+    #: no context, so it matches on a single shared word: "will that be a
+    #: full pot?" became the moon calendar, "this is the entire log, can you
+    #: look for it?" the audit-log status. A command whose subject is one
+    #: noun ("moon", "logging") names it here. Prefix commands skip it.
+    topic: Optional[str] = None
+
+    def on_topic(self, text: str) -> bool:
+        return (self.topic is None
+                or re.search(self.topic, text or "", re.IGNORECASE) is not None)
 
     def describe_call(self, args: Mapping[str, Any]) -> Optional[str]:
         if self.confirm_phrase is None:

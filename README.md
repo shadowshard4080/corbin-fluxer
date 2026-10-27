@@ -114,7 +114,7 @@ go. "Corbin, always reply in here" makes one channel answer every message.
 | Personality, voice, opinions | `persona/SOUL.md` (sent to the model as its system prompt) |
 | Interests and specific tastes | `persona/SOUL_ADDITIONS.md` (sent every time) |
 | Baked-in persona for Ollama | the `SYSTEM` block in `ollama/Modelfile` |
-| Owner (owner-only commands) | `BOT_OWNER_ID` |
+| Owner (bot-level owner-only commands; no permissions inside servers) | `BOT_OWNER_ID` |
 | His own custom emoji | `BOT_EMOJI_NAME` + `BOT_EMOJI_ID`, and mention it in the persona |
 | Rank role names and colours | `RANK_ROLES_FILE` (JSON, see `.env.example`) |
 | Level-up image | `LEVEL_UP_IMAGE` |
@@ -148,6 +148,98 @@ Modelfile, run `ollama create` again.
 - **YouTube bot checks:** if music playback fails with "confirm you're not a
   bot", run `python tools/check_youtube.py`. Usually it needs exported cookies
   (`YTDL_COOKIEFILE`) and a [PO token provider](https://github.com/Brainicism/bgutil-ytdlp-pot-provider).
+
+## Voice chat
+
+He can talk out loud in voice channels ("talk with me in voice"; "stop
+listening" to end it). Speech recognition and his voice come from
+[VoiceStudio](https://github.com/debpalash/VoiceStudio) running on the same
+machine, so nothing leaves it.
+
+1. Install VoiceStudio, open it, and install a voice engine (OmniVoice) and
+   a speech-recognition model (Whisper large-v3 Turbo is a good fit). The
+   **Balanced** performance tier keeps replies quick.
+2. Allow it per server. As the owner (`BOT_OWNER_ID`), DM the bot:
+   "add <server id> to the allowlist for voice". ("which servers have
+   voice?" lists them, "remove ... from the allowlist" takes one off.)
+   `VOICE_CHAT_GUILDS=<id>,<id>` in `.env` seeds the list on first boot
+   only. Nothing is allowed until you do one of these.
+3. Optionally pick his voice with `VOICESTUDIO_VOICE` (a voice-profile name
+   or id from VoiceStudio).
+4. His voice runs through a raven effect (`VOICE_FX=raven`: a little higher,
+   a nasal beak edge, a light croak and grit). Set `VOICE_FX=off` for the
+   plain voice, or give your own ffmpeg filter chain.
+
+The bot checks VoiceStudio at startup and logs whether voice chat is ready.
+It checks again each time someone starts voice chat, so opening VoiceStudio
+after the bot needs no restart.
+
+In the channel:
+
+- **One-to-one** he answers everything. **With others there**, he answers
+  only when someone says his name, plus a short follow-up from whoever he
+  just answered. People talking to each other are left alone.
+- **Commands work spoken:** "Corbin, play the radio", "skip this song",
+  and "yes" to a confirmation. Cards and embeds go to the voice channel's
+  text chat.
+- **Over music or radio** he pauses the audio while he speaks, then resumes.
+- **Spoken commands are limited:** nothing staff-only, owner-only or
+  destructive runs from voice; those must be typed.
+- **Privacy:** "don't listen to me" means he never hears that person again
+  (until they say otherwise). No audio is stored.
+- He leaves a voice channel about 20 s after everyone else has left.
+
+**Sharing a GPU.** VoiceStudio and a local LLM on one graphics card may not
+both fit in its memory. This template has no cloud model to hand replies
+to while he's in voice, so the LLM stays loaded: if speech models fail to
+load, run the LLM on another machine (`LLM_URL`), use a smaller model, or
+give VoiceStudio its own GPU.
+
+## Optional features
+
+Each of these is off, or quietly idle, until it's set up. The bot boots
+and chats without any of them, and logs one line saying which are off.
+
+| Feature | Needs | On / off |
+|---|---|---|
+| Music, radio | `pip install 'fluxer.py[voice]'`, ffmpeg, yt-dlp | on when the voice extra is installed |
+| Voice chat | the above, plus VoiceStudio; owner allowlist "voice" | `VOICE_CHAT=0` turns it off |
+| Streaming video (music videos, live TV, video library) | the voice extra and ffmpeg; owner allowlist "streaming" | per server via the allowlist; `IPTV=0` drops live TV |
+| Video library | a folder at `VIDEO_ROOT` (one folder per show) | missing folder = no videos |
+| Reaction controls (verse, music, TV and video cards) | Manage Messages lets him reset each press | always on |
+| Reaction roles, opt-in DM roles | Manage Roles (and Manage Channels to make #reaction-roles) | "set up reaction roles" |
+| Banner rotation | Manage Server, and a server with the banner feature | "set up banner rotation" |
+| Rank roles per server | Manage Roles | "rank-role-set 10 Regular #ff8800" |
+| Encryption at rest | `pip install cryptography`, `DATA_KEY_FILE` | empty = plain JSON |
+| Log file | nothing | `LOG_FILE=` (empty) for stderr only |
+
+**The owner's allowlist.** Voice chat and streaming are default-deny per
+server. As `BOT_OWNER_ID`, DM the bot "add <server id> to the allowlist for
+streaming" (or "for voice", or "for both"). Server admins then manage live
+TV themselves: on/off, allowed categories, a watch limit, and stream
+quality ("set the stream quality to 1080p", which needs `ALLOW_1080P=1`).
+
+**Streaming.** Viewers click the bot's tile in the voice channel to watch:
+it stays grey until they do (that's Fluxer). "Stream the video" (or 📺 on
+the Now Playing card) shows the playing song's music video; "what's on TV?"
+lists live channels from [iptv-org](https://github.com/iptv-org/iptv);
+"what videos do you have?" lists your library. Only one stream runs at a
+time across all servers, and voice chat stops while it does.
+`python tools/check_iptv.py` tests the TV catalogue from your host.
+
+**Opt-in DM roles.** A reaction role can be marked as a DM role: only
+members who react for it themselves get it, and `messager` DMs only them.
+If anyone else hands it out (a moderator, another bot), he takes it back.
+
+**Memory opt-out.** Anyone can say "don't remember me": he deletes what he
+has about them and saves nothing new, in any server.
+
+**Encryption at rest.** `python tools/encrypt_data.py --new-key` prints a
+key; save it in a file outside the bot's folder and set `DATA_KEY_FILE`.
+Files are encrypted as they're next written, or all at once with
+`python tools/encrypt_data.py` (stop the bot first). If the key is lost
+the data can't be read, and the bot refuses to start rather than overwrite
+it. Logs never hold what people write unless `LOG_LEVEL=DEBUG`.
 
 ## How a command runs
 

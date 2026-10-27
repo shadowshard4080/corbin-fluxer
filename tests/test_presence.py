@@ -36,18 +36,23 @@ def suite_window(r: Results) -> None:
 
 
 def suite_transcript(r: Results) -> None:
-    entries = [_e("Sam", "hello"), _e("Alex", "hi there")]
+    entries = [_e("Lux", "hello"), _e("Juniper", "hi there")]
     text, indexed = numbered_transcript(entries)
-    r.ok("numbered from 1", text.startswith("#1 [Sam]: hello"))
-    r.ok("second line numbered", "#2 [Alex]: hi there" in text)
+    r.ok("numbered from 1", text.startswith("#1 [Lux]: hello"))
+    r.ok("second line numbered", "#2 [Juniper]: hi there" in text)
     r.check("indexed matches", len(indexed), 2)
     long_text, _ = numbered_transcript([_e("A", "x" * 900)], max_len=50)
     r.ok("content truncated", len(long_text) < 120)
     r.check("empty input", numbered_transcript([])[0], "")
+    pic = _e("Lazaro", "")
+    pic["media"] = ["an image (art.png)"]
+    r.ok("an image-only post is named, not blank",
+         "#1 [Lazaro]: [posted an image (art.png), which you cannot see]"
+         in numbered_transcript([pic])[0])
 
 
 def suite_decision(r: Results) -> None:
-    indexed = [_e("Sam", "anyone know?"), _e("Corbin", "hi", is_bot=True)]
+    indexed = [_e("Lux", "anyone know?"), _e("Corbin", "hi", is_bot=True)]
 
     r.check("PASS stays quiet", parse_decision("PASS", indexed)[0], None)
     r.check("empty stays quiet", parse_decision("", indexed)[0], None)
@@ -55,7 +60,7 @@ def suite_decision(r: Results) -> None:
 
     target, reason = parse_decision("RESPOND #1 | they asked a question",
                                     indexed)
-    r.check("picks the right entry", target["author"], "Sam")
+    r.check("picks the right entry", target["author"], "Lux")
     r.check("reason captured", reason, "they asked a question")
     r.ok("hash optional", parse_decision("RESPOND 1", indexed)[0] is not None)
     # "pass" inside the reason used to veto the RESPOND outright.
@@ -77,35 +82,37 @@ def suite_decision(r: Results) -> None:
 
 
 def suite_reply_target(r: Results) -> None:
-    sam, alex = _e("Sam", "what's for dinner"), _e("Alex", "no idea")
-    entries = [sam, alex]
+    pip, juniper = _e("Lux", "what's for dinner"), _e("Juniper", "no idea")
+    entries = [pip, juniper]
 
     r.check("no target stays None", reply_target("hi", entries, None), None)
     r.check("naming the target keeps it",
-            reply_target("Sam, ramen", entries, sam)["author"], "Sam")
+            reply_target("Lux, ramen", entries, pip)["author"], "Lux")
     r.check("naming someone else moves the arrow",
-            reply_target("Alex has the right idea", entries, sam)["author"],
-            "Alex")
+            reply_target("Juniper has the right idea", entries, pip)["author"],
+            "Juniper")
     r.check("naming nobody keeps the original",
-            reply_target("ramen sounds good", entries, sam)["author"], "Sam")
+            reply_target("ramen sounds good", entries, pip)["author"], "Lux")
     r.check("naming both keeps the original",
-            reply_target("Sam and Alex both right", entries, sam)["author"],
-            "Sam")
+            reply_target("Lux and Juniper both right", entries, pip)["author"],
+            "Lux")
 
 
 class _Stub:
     """Minimal llm/conversation doubles."""
 
     class constants:
-        MODEL_FAST = "fast"; MODEL_MAIN = "main"
+        MODEL_FAST = "fast"; MODEL_MAIN = MODEL_REPLY = MODEL_THINK = "main"
         EFFORT_FAST = "none"; EFFORT_MAIN = "low"; EFFORT_PRESENCE = "low"
 
     def __init__(self, decision="PASS", reply="sure"):
         self.decision, self.reply = decision, reply
         self.calls = []
+        self.kwargs = []
 
     async def call(self, *, model, **kw):
         self.calls.append(model)
+        self.kwargs.append(kw)
         text = self.decision if model == "fast" else self.reply
         return type("R", (), {"text": text, "truncated": False})()
 

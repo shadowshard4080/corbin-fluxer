@@ -40,8 +40,8 @@ def suite_exemption(r: Results) -> None:
                  Perm.KICK_MEMBERS, Perm.MODERATE_MEMBERS):
         r.ok(f"{perm.name} is exempt", is_exempt(_Member(perm)))
     r.ok("guild owner exempt", is_exempt(_Member(owner=True)))
-    r.ok("bot owner exempt",
-         is_exempt(_Member(uid="999"), bot_owner_id="999"))
+    r.ok("the bot owner is not exempt just for being the bot owner",
+         not is_exempt(_Member(Perm.SEND_MESSAGES, uid="999")))
     # Never ban on a guess: an unresolvable member is treated as exempt.
     r.ok("unknown member is exempt", is_exempt(None))
 

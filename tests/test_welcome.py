@@ -14,8 +14,8 @@ from corbin.core.welcome import (DEFAULT_FAREWELL, DEFAULT_WELCOME,
 
 def suite_templates(r: Results) -> None:
     r.check("member substituted",
-            render_template("hi {member}", member="@Sam", server="S"),
-            "hi @Sam")
+            render_template("hi {member}", member="@Lux", server="S"),
+            "hi @Lux")
     r.check("server substituted",
             render_template("welcome to {server}", member="@L", server="Den"),
             "welcome to Den")
@@ -36,17 +36,17 @@ def suite_templates(r: Results) -> None:
 
 
 def suite_card(r: Results) -> None:
-    png = make_welcome_card("Sam", "Welcome to The Den!")
+    png = make_welcome_card("Lux", "Welcome to The Den!")
     if png is None:
         r.ok("Pillow missing, card skipped cleanly", True)
         return
     r.ok("returns bytes", isinstance(png, bytes) and len(png) > 500)
     r.ok("is a PNG", png[:8] == b"\x89PNG\r\n\x1a\n")
     r.ok("survives a long message",
-         make_welcome_card("Sam", "x " * 200) is not None)
+         make_welcome_card("Lux", "x " * 200) is not None)
     r.ok("survives an empty name", make_welcome_card("", "hi") is not None)
     r.ok("garbage avatar bytes do not crash",
-         make_welcome_card("Sam", "hi", b"not an image") is None
+         make_welcome_card("Lux", "hi", b"not an image") is None
          or True)
 
 
@@ -86,10 +86,10 @@ def suite_settings(r: Results) -> None:
 
 
 def suite_greeting_prompt(r: Results) -> None:
-    p = build_prompt(server_name="The Den", display_name="Sam",
-                     username="sam", custom_info="read #rules")
+    p = build_prompt(server_name="The Den", display_name="Lux",
+                     username="pip", custom_info="read #rules")
     r.ok("names the server", "The Den" in p)
-    r.ok("names the member", "Sam" in p)
+    r.ok("names the member", "Lux" in p)
     r.ok("includes custom info", "read #rules" in p)
     r.ok("forbids a mention", "NOT include a mention" in p)
     r.ok("forbids opening with the name", "NOT open with their name" in p)

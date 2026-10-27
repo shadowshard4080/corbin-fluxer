@@ -12,7 +12,8 @@ from corbin.core.moon import (MOON_NAMES, PHASES, MoonCalculator,
                               phase_name)
 from corbin.core.settings import ChatSettings
 
-REPO = str(Path(__file__).resolve().parent.parent / "data")
+#: This bot's folder; the ephemeris lives in its data/.
+REPO = str(Path(__file__).resolve().parent.parent)
 
 
 def suite_pure(r: Results) -> None:

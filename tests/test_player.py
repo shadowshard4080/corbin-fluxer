@@ -57,10 +57,10 @@ def suite_track(r: Results) -> None:
     t = track_from_info({"title": "Song", "url": "http://s",
                          "duration": 200, "uploader": "Artist",
                          "thumbnail": "http://t"},
-                        requested_by="u1", requester_name="Sam")
+                        requested_by="u1", requester_name="Lux")
     r.check("title", t.title, "Song")
     r.check("duration formatted", t.pretty_duration, "3:20")
-    r.check("requester kept", t.requester_name, "Sam")
+    r.check("requester kept", t.requester_name, "Lux")
     r.ok("not live", not t.is_live)
 
     # A stream url is often only inside formats.

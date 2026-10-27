@@ -182,10 +182,141 @@ def suite_config_commands(r: Results) -> None:
                 "silenced")
 
 
+def suite_silence(r: Results) -> None:
+    from corbin.commands.config_cmds import (QUIET_ESCAPE, match_silence_answer,
+                                             works_while_quiet)
+    from corbin.core.registry import registry
+    with tempfile.TemporaryDirectory() as tmp:
+        cs = ChatSettings(Path(tmp) / "chat.json")
+        silence = registry.get("silence")
+        unsilence = registry.get("unsilence")
+        r.ok("unsilence exists", unsilence is not None)
+        # The classifier sees only examples[:3]; "turn off presence in #x"
+        # was refused as an unknown command "presence" when it wasn't there.
+        r.ok("silence's visible examples mention presence",
+             any("presence" in e for e in silence.examples[:3]))
+        r.ok("...and so do unsilence's",
+             any("presence" in e for e in unsilence.examples[:3]))
+        # Checked against the REAL spec names: the allowlist once held
+        # snake_case while specs are kebab-case, and dropped everything.
+        r.ok("unsilence works while quiet", works_while_quiet(unsilence.name))
+        r.ok("...and so does the mode switch",
+             works_while_quiet(registry.get("chat_mode").name))
+        r.ok("...and silence (answers 'already silenced')",
+             works_while_quiet(silence.name))
+        r.ok("other commands don't",
+             not works_while_quiet(registry.get("reply_channel").name))
+
+        # A named channel is silenced, not the one asked from.
+        ctx = _ctx(cs)
+        ctx.extras["channel_index"] = {"art": "c3"}
+        out = asyncio.run(silence.handler(ctx, channel="#art"))
+        r.ok("named channel silenced", cs.is_silenced("g1", "c3"))
+        r.ok("current channel untouched", not cs.is_silenced("g1", "c1"))
+        r.ok("reply names it", "<#c3>" in out)
+        ctx_x = _ctx(cs)
+        ctx_x.extras["channel_index"] = {}
+        out = asyncio.run(silence.handler(ctx_x, channel="#nowhere"))
+        r.ok("unknown channel refuses, doesn't fall back",
+             "couldn't find" in out and not cs.is_silenced("g1", "c1"))
+        out = asyncio.run(silence.handler(ctx, channel="art"))
+        r.ok("silencing twice is not a toggle",
+             cs.is_silenced("g1", "c3") and "already" in out)
+
+        # Unsilence: from here, by name, and from inside the channel.
+        out = asyncio.run(unsilence.handler(ctx, channel="#art"))
+        r.ok("unsilence by name", not cs.is_silenced("g1", "c3"))
+        cs.set_silenced("g1", "c1", True)
+        asyncio.run(unsilence.handler(_ctx(cs)))
+        r.ok("unsilence in the silenced channel itself",
+             not cs.is_silenced("g1", "c1"))
+        out = asyncio.run(unsilence.handler(_ctx(cs)))
+        r.ok("unsilence when not silenced says so", "wasn't" in out)
+        cs.set_silenced("g1", "c4", True)
+        cs.set_presence_off("g1", "c5", True)
+        out = asyncio.run(unsilence.handler(_ctx(cs), channel="everywhere"))
+        r.ok("unsilence everywhere clears both kinds",
+             not cs.silenced("g1") and not cs.presence_off("g1"))
+        cs.set_mode("g1", "off")
+        out = asyncio.run(unsilence.handler(_ctx(cs)))
+        r.ok("mode off is pointed out", "server-wide" in out)
+
+        # Global mode asks presence-or-silence, and remembers asking.
+        cs.set_mode("g1", "global")
+        asked = {}
+        ctx_q = _ctx(cs)
+        ctx_q.extras["silence_questions"] = asked
+        out = asyncio.run(silence.handler(ctx_q))
+        r.ok("global mode asks", "Presence or silence?" in out)
+        r.ok("...nothing changed yet", not cs.is_silenced("g1", "c1"))
+        r.check("...question waits for this person here",
+                asked.get(("c1", "u1"), (None, None))[:2], ("g1", "c1"))
+        out = asyncio.run(silence.handler(ctx_q, scope="presence"))
+        r.ok("explicit presence scope", cs.is_presence_off("g1", "c1")
+             and not cs.is_silenced("g1", "c1"))
+        asked.clear()
+        out = asyncio.run(silence.handler(ctx_q))
+        r.ok("presence already off: silences without asking",
+             cs.is_silenced("g1", "c1") and not asked)
+        cs.set_mode("g1", "mention")
+        cs.set_silenced("g1", "c1", False)
+        cs.set_presence_off("g1", "c1", False)
+        asyncio.run(silence.handler(ctx_q))
+        r.ok("mention mode: no question, just silence",
+             cs.is_silenced("g1", "c1") and not asked)
+
+        r.check("'presence' answers", match_silence_answer("presence"), "presence")
+        r.check("'just stop chiming in'", match_silence_answer(
+            "just stop chiming in"), "presence")
+        r.check("'completely'", match_silence_answer("completely"), "all")
+        r.check("'silence'", match_silence_answer("silence please"), "all")
+        r.check("'go fully silent'", match_silence_answer("go fully silent"), "all")
+        r.check("unrelated is not an answer",
+                match_silence_answer("lol nice art"), None)
+        r.check("ambiguous is not an answer",
+                match_silence_answer("stop chiming in at all"), None)
+
+        r.ok("escape filter passes unsilence", bool(QUIET_ESCAPE.search(
+            "@Corbin unsilence")))
+        r.ok("escape filter passes 'you can talk again'",
+             bool(QUIET_ESCAPE.search("you can talk here again")))
+        r.ok("escape filter drops chatter",
+             not QUIET_ESCAPE.search("anyone seen my keys"))
+
+        # Unsilence is matched without the classifier, typos included.
+        from corbin.commands.config_cmds import match_unsilence
+        for said in ("@Corbin unsilence", "corbin unsilnce", "Corbin un-silence",
+                     "corbin unslience pls", "Corbin unsilense",
+                     "corbin you can talk here again", "Corbin unmute",
+                     "corbin stop being silent", "corbin lift the silence"):
+            r.check(f"unsilence matched: {said!r}", match_unsilence(said), {})
+        for said in ("corbin that was unsanctioned", "corbin be quiet",
+                     "corbin silence", "corbin I'm unsure"):
+            r.check(f"not unsilence: {said!r}", match_unsilence(said), None)
+        r.check("unsilence everywhere", match_unsilence(
+            "corbin unsilence everywhere"), {"channel": "all"})
+        r.check("unsilence a linked channel", match_unsilence(
+            "corbin unsilence #art", ["c3"]), {"channel": "c3"})
+
+        # ...and run with the hard gates still on.
+        from corbin.core.dispatch import Dispatcher
+        from corbin.core.risk import Decision
+        d = Dispatcher(registry, classifier=None)
+        mod = member("u1", perms=Perm.MANAGE_GUILD)
+        res = d.direct("unsilence", {}, invoker=mod, guild_id="g1")
+        r.ok("a mod's direct unsilence executes",
+             res.decision is Decision.EXECUTE and works_while_quiet(res.spec.name))
+        pleb = member("u2")
+        res = d.direct("unsilence", {}, invoker=pleb, guild_id="g1")
+        r.ok("a non-mod's is denied", res.decision is Decision.DENIED
+             and "permission" in res.message)
+
+
 SUITES = [
     ("settings store", suite_store),
     ("chat settings", suite_chat_settings),
     ("config commands", suite_config_commands),
+    ("silence", suite_silence),
 ]
 
 if __name__ == "__main__":

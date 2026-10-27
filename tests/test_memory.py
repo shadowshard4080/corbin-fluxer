@@ -7,8 +7,8 @@ logging.getLogger("corbin").setLevel(logging.CRITICAL)
 from _harness import Results, run
 
 from corbin.ai.extraction import build_prompt, parse
-from corbin.core.memory import (MAX_USER_FACTS, MemoryStore, ServerMemory,
-                                UserMemory, clean_fact)
+from corbin.core.memory import (MAX_USER_FACTS, MemoryOptOut, MemoryStore,
+                                ServerMemory, UserMemory, clean_fact)
 
 
 def suite_user_memory(r: Results) -> None:
@@ -44,8 +44,8 @@ def suite_user_memory(r: Results) -> None:
     r.ok("newest kept, oldest dropped",
          big.facts[-1].endswith(str(MAX_USER_FACTS + 14)))
 
-    m.touch("Sam")
-    r.check("display name recorded", m.display_name, "Sam")
+    m.touch("Lux")
+    r.check("display name recorded", m.display_name, "Lux")
     r.check("interaction counted", m.interaction_count, 1)
     r.ok("last seen stamped", bool(m.last_seen))
 
@@ -65,10 +65,10 @@ def suite_store(r: Results) -> None:
         r.check("unknown user is empty", store.get_user("u").facts, [])
 
         entry = store.get_user("u")
-        entry.apply(["likes ravens"]); entry.touch("Sam")
+        entry.apply(["likes ravens"]); entry.touch("Lux")
         store.save_user(entry)
         r.check("persists", store.get_user("u").facts, ["likes ravens"])
-        r.check("display name persists", store.get_user("u").display_name, "Sam")
+        r.check("display name persists", store.get_user("u").display_name, "Lux")
         r.check("no temp files", list(store.users.glob("*.tmp")), [])
 
         srv = store.get_server("g"); srv.apply(["SERVER:weekly movie night"])
@@ -76,8 +76,8 @@ def suite_store(r: Results) -> None:
         r.check("server persists", store.get_server("g").facts,
                 ["weekly movie night"])
 
-        block = store.context_block("u", "g", "Sam")
-        r.ok("names the person", "Sam" in block)
+        block = store.context_block("u", "g", "Lux")
+        r.ok("names the person", "Lux" in block)
         r.ok("includes user facts", "likes ravens" in block)
         r.ok("includes server facts", "weekly movie night" in block)
         r.ok("tells the model not to recite", "never as a list" in block)
@@ -103,10 +103,10 @@ def suite_store(r: Results) -> None:
 
 
 def suite_extraction(r: Results) -> None:
-    p = build_prompt(display_name="Sam", user_content="my dog hates rain",
+    p = build_prompt(display_name="Lux", user_content="my dog hates rain",
                      bot_response="ha", known_facts=["likes post-rock"],
                      include_server=True)
-    r.ok("names the speaker", "Sam" in p)
+    r.ok("names the speaker", "Lux" in p)
     r.ok("indexes known facts", "[0] likes post-rock" in p)
     r.ok("explains UPDATE", "UPDATE:<index>:" in p)
     r.ok("demands IANA", "IANA" in p)
@@ -115,7 +115,7 @@ def suite_extraction(r: Results) -> None:
     # A fact can span turns: "Her name is Ziggy" means nothing on its own,
     # but after "what's my dog's name?" it clearly names the user's dog.
     with_ctx = build_prompt(
-        display_name="Sam", user_content="Her name is Ziggy",
+        display_name="Lux", user_content="Her name is Ziggy",
         bot_response="Got it.", known_facts=[],
         recent=[{"role": "user", "content": "what's my dog's name?"},
                 {"role": "assistant", "content": "I don't know it."}])
@@ -158,11 +158,11 @@ def suite_memory_framing(r: Results) -> None:
     from corbin.core.memory import MemoryStore, UserMemory
     from corbin.ai.extraction import build_prompt
 
-    entry = UserMemory("u", display_name="Riley")
+    entry = UserMemory("u", display_name="Nightjar")
     entry.facts = ["likes casseroles", "has a dog called Ziggy"]
     store = MemoryStore(tempfile.mkdtemp())
     store.save_user(entry)
-    block = store.context_block("u", None, "Riley")
+    block = store.context_block("u", None, "Nightjar")
 
     # Before the facts, where a small model is still reading.
     head = block[:block.index("- likes casseroles")]
@@ -178,7 +178,7 @@ def suite_memory_framing(r: Results) -> None:
             empty.context_block("nobody", None, "X"), "")
 
     # The extractor is what let an errand become a fact.
-    prompt = build_prompt(display_name="Riley", user_content="hi",
+    prompt = build_prompt(display_name="Nightjar", user_content="hi",
                           bot_response="hello", known_facts=[])
     r.ok("the extractor refuses requests and tasks",
          "never store a request" in prompt.lower())
@@ -187,7 +187,90 @@ def suite_memory_framing(r: Results) -> None:
          "stable attribute" in prompt.lower())
 
 
+def suite_optout(r: Results) -> None:
+    """"Don't remember me": nothing saved by any route, no extraction
+    call, and the command deletes what there was."""
+    import asyncio, types
+    from corbin.ai.conversation import Conversation
+    from corbin.commands import memory_cmds as M
+    from corbin.core.settings import ChatSettings
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cs = ChatSettings(Path(tmp) / "chat.json")
+        optout = MemoryOptOut(cs)
+        store = MemoryStore(tmp, opted_out=optout)
+        m = store.get_user("u1")
+        m.apply(["has a dog"])
+        store.save_user(m)
+        r.ok("saved while opted in", store.user_path("u1").is_file())
+
+        optout.set("u1", True)
+        store.forget_user("u1")
+        m.apply(["has a cat"])
+        store.save_user(m)
+        r.ok("opted out: save_user writes nothing",
+             not store.user_path("u1").exists())
+        fresh = UserMemory("u1")
+        fresh.preferences["timezone"] = "America/Denver"
+        store.save_user(fresh)
+        r.ok("...whoever the writer is (a reminder's timezone, a claim)",
+             not store.user_path("u1").exists())
+        optout.set("u1", False)
+        store.save_user(m)
+        r.ok("opting back in saves again", store.user_path("u1").is_file())
+
+        broken = store.users / "u2.corrupt.1700000000.json"
+        broken.parent.mkdir(parents=True, exist_ok=True)
+        broken.write_text("{bad")
+        r.ok("forget-me also deletes quarantined copies",
+             store.forget_user("u2") and not broken.exists())
+
+        class Bad:
+            store = None
+        r.ok("an unreadable opt-out fails closed",
+             MemoryOptOut(Bad()).opted_out("u3"))
+
+        calls = []
+
+        class Extractor:
+            async def extract(self, **kw):
+                calls.append(kw)
+                return ["likes ravens"], ["SERVER: runs game nights"]
+
+        fake = types.SimpleNamespace(memory=store, extractor=Extractor())
+        optout.set("u4", True)
+        asyncio.run(Conversation._remember(
+            fake, user_id="u4", display_name="Quill", guild_id="g1",
+            user_content="I love ravens", bot_response="Same."))
+        r.check("opted out: no extraction call at all", calls, [])
+        r.ok("...and no server facts from their messages",
+             not store.server_path("g1").exists())
+        asyncio.run(Conversation._remember(
+            fake, user_id="u5", display_name="Kit", guild_id="g1",
+            user_content="I love ravens", bot_response="Same."))
+        r.ok("someone opted in is still remembered",
+             len(calls) == 1 and store.get_user("u5").facts)
+
+        cleared = []
+        ctx = types.SimpleNamespace(
+            invoker=types.SimpleNamespace(id="u5"),
+            extras={"memory": store, "memory_optout": optout,
+                    "conversation": types.SimpleNamespace(
+                        clear_user=cleared.append)})
+        out = asyncio.run(M.memory_optout(ctx))
+        r.ok("the command opts out, deletes, and drops recent history",
+             optout.opted_out("u5") and not store.user_path("u5").exists()
+             and cleared == ["u5"] and "won't save" in out.content)
+        r.ok("...and the reply goes privately", out.private)
+        asyncio.run(M.memory_optout(ctx, out=False))
+        r.ok("opting back in", not optout.opted_out("u5"))
+        cleared.clear()
+        asyncio.run(M.forget_me(ctx))
+        r.check("forget-me drops recent history too", cleared, ["u5"])
+
+
 SUITES = [
+    ("memory opt-out", suite_optout),
     ("user memory", suite_user_memory),
     ("server memory", suite_server_memory),
     ("memory store", suite_store),

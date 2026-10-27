@@ -183,7 +183,7 @@ def suite_stores(r: Results) -> None:
 
 def suite_conversion(r: Results) -> None:
     class U:
-        id = 5; username = "sam"; bot = False
+        id = 5; username = "pip"; bot = False
         created_at = "2024-01-05T00:00:00Z"
 
     class Role_:
@@ -194,7 +194,7 @@ def suite_conversion(r: Results) -> None:
 
     u = to_user(U())
     r.check("user id stringified", u.id, "5")
-    r.check("display falls back to username", u.display_name, "sam")
+    r.check("display falls back to username", u.display_name, "pip")
     r.ok("created_at parsed", u.created_at is not None)
 
     m = to_member(M(), guild_id="g1", guild_owner_id="99")
@@ -282,6 +282,34 @@ def suite_typing(r: Results) -> None:
         return True
     r.ok("context manager enters and exits cleanly", asyncio.run(_block()))
 
+    # Typing starts the moment a message arrives, so entering must not
+    # wait on the network, and the handler's block nests the inner ones.
+    class SlowChan(Chan):
+        async def trigger_typing(self):
+            self.hits += 1
+            await asyncio.sleep(0.2)
+
+    slow = SlowChan()
+    e = FluxerAdapter(Client(slow))
+
+    async def _nested():
+        loop = asyncio.get_running_loop()
+        began = loop.time()
+        async with e.typing("c1"):
+            entered = loop.time() - began
+            await asyncio.sleep(0)
+            async with e.typing("c1"):
+                await asyncio.sleep(0.01)
+            inner_left = "c1" in e._typing_tasks
+        return entered, inner_left, "c1" in e._typing_tasks
+
+    entered, inner_left, still = asyncio.run(_nested())
+    r.ok("entering does not wait for the request", entered < 0.05)
+    r.ok("an inner block keeps the outer indicator", inner_left)
+    r.check("nesting shares one request", slow.hits, 1)
+    r.ok("the last exit stops it", not still)
+    r.check("no refs left behind", e._typing_refs, {})
+
 
 def suite_guild_resolution(r: Results) -> None:
     from corbin.platforms.fluxer.adapter import _message_guild_id, to_channel
@@ -324,7 +352,7 @@ def suite_weather_params(r: Results) -> None:
     r.check("US state gets a country",
             _location_params("Denver, CO"), {"q": "Denver,CO,US"})
     r.check("lowercase state normalised",
-            _location_params("ellensburg, wa"), {"q": "ellensburg,WA,US"})
+            _location_params("denver, co"), {"q": "denver,CO,US"})
     r.check("postcode uses zip=, not q=",
             _location_params("80202"), {"zip": "80202,US"})
     r.check("explicit country preserved",

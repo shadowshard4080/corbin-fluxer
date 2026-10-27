@@ -13,10 +13,62 @@ from typing import Any, Optional
 from ..core.audio import format_duration
 from ..core.context import CommandContext, Embed
 from ..core.permissions import Perm
+from ..core.reactions import Controls, legend
 from ..core.registry import Param, Risk, command
 
 COLOUR = 0x1DB954
 QUEUE_PAGE = 10
+
+#: Reaction controls on the Now Playing card. Only people in the bot's
+#: voice channel can use them (see ``bot.py``'s music panel handler).
+MUSIC_BUTTONS = (("⏯️", "pause/resume"), ("⏮️", "restart"),
+                 ("⏭️", "skip"), ("⏹️", "stop"),
+                 ("🔁", "loop"), ("🔀", "shuffle"))
+#: Added to the card where the music video can be streamed (the server is
+#: on the owner's ``streaming`` allowlist and the track has a video page).
+VIDEO_BUTTON = ("📺", "video")
+#: 🔁 cycles through these.
+LOOP_CYCLE = ("off", "track", "queue")
+
+
+def video_status(extras: Any, guild_id: Optional[str]) -> str:
+    """The card's video line from a command's extras ("" if off)."""
+    mv = (extras or {}).get("music_video") if extras else None
+    return mv.status_line(guild_id) if mv is not None else ""
+
+
+def video_ok(features: Any, guild_id: Optional[str], track: Any) -> bool:
+    """Should this card offer 📺? Streaming allowed here, and a video."""
+    from ..core.music_video import is_video_page
+
+    if features is None or not guild_id or track is None:
+        return False
+    try:
+        allowed = features.allowed(str(guild_id), "streaming")
+    except Exception:
+        return False
+    return bool(allowed) and is_video_page(getattr(track, "webpage_url", ""))
+
+
+def loop_mode(player: Any) -> str:
+    if getattr(player, "loop_track", False):
+        return "track"
+    if getattr(player, "loop_queue", False):
+        return "queue"
+    return "off"
+
+
+def player_status(player: Any) -> str:
+    """"▶️ Playing" / "⏸️ Paused", plus the loop mode if any."""
+    bits = []
+    if player is not None and getattr(player, "paused", False):
+        bits.append("⏸️ Paused")
+    elif player is not None and getattr(player, "current", None) is not None:
+        bits.append("▶️ Playing")
+    mode = loop_mode(player) if player is not None else "off"
+    if mode != "off":
+        bits.append(f"🔁 Looping {mode}")
+    return " · ".join(bits)
 
 
 def _voice_channel(ctx: CommandContext, name: Optional[str]) -> Optional[str]:
@@ -31,7 +83,17 @@ def _voice_channel(ctx: CommandContext, name: Optional[str]) -> Optional[str]:
 
 
 def track_embed(track: Any, *, title: str = "Now playing",
-                position: Optional[int] = None) -> Embed:
+                position: Optional[int] = None,
+                guild_id: Optional[str] = None, player: Any = None,
+                note: str = "", video: bool = False,
+                status: str = "", activity: str = "") -> Embed:
+    """The track card. With ``guild_id`` it is a Now Playing panel: it
+    carries the reaction controls and says so in the footer.
+
+    The footer is live (``bot.py`` re-renders it as things change): an
+    ``activity`` in progress ("⏮️ Starting from the beginning…") in place
+    of the playing/paused line, then the video's ``status`` line, then
+    ``note`` (who did what last)."""
     embed = Embed(title=title, colour=COLOUR,
                   description=(f"**[{track.title}]({track.webpage_url})**"
                                if track.webpage_url else f"**{track.title}**"))
@@ -44,6 +106,18 @@ def track_embed(track: Any, *, title: str = "Now playing",
         embed.add_field("Requested by", track.requester_name, inline=True)
     if track.thumbnail:
         embed.thumbnail_url = track.thumbnail
+    if guild_id:
+        # 📺 first (owner, 2026-10-20): reactions go on in this order,
+        # one at a time, so the first is clickable as soon as the card
+        # loads; the video is what people reach for.
+        buttons = ((VIDEO_BUTTON,) if video else ()) + MUSIC_BUTTONS
+        lines = [x for x in (activity or player_status(player), status,
+                             note) if x]
+        lines.append("React: " + legend(buttons))
+        embed.footer = "\n".join(lines)
+        embed.controls = Controls(kind="music", buttons=buttons,
+                                  state={"guild_id": str(guild_id)},
+                                  exclusive=True)
     return embed
 
 
@@ -66,6 +140,21 @@ async def play(ctx: CommandContext, query: str,
                channel: Optional[str] = None) -> Any:
     player_mgr = ctx.extras.get("player")
     extractor = ctx.extras.get("extractor")
+    # "Play Bob's Burgers episode 3" is the video library, not a YouTube
+    # search for a song: a show named by its whole folder name goes there.
+    videos = ctx.extras.get("videos")
+    if videos is not None:
+        from ..core.library import show_in_text
+
+        show = show_in_text(videos.shows(), query)
+        if show is not None:
+            from .video_cmds import parse_request, video_play
+
+            season, episode = parse_request(query)
+            return await video_play(
+                ctx, show=show.name,
+                episode=str(episode) if episode is not None else None,
+                season=season, voice_channel=channel)
     if player_mgr is None or extractor is None:
         return "Music support isn't loaded."
     target = _voice_channel(ctx, channel)
@@ -114,7 +203,13 @@ async def play(ctx: CommandContext, query: str,
                                             announce=False)
         if failure:
             return failure
-        embed = track_embed(track)
+        embed = track_embed(track, guild_id=ctx.guild_id, player=player,
+                            video=video_ok(ctx.extras.get("features"),
+                                           ctx.guild_id, track),
+                            status=video_status(ctx.extras, ctx.guild_id))
+        # This reply is the card. If the player's own announcement fires
+        # for the same track in this channel, it skips.
+        player.last_card = (id(track), str(ctx.channel.id))
 
     if rest:
         player_mgr.start_import(ctx.guild_id, target, rest, **who)
@@ -149,6 +244,28 @@ async def skip(ctx: CommandContext) -> str:
     if nxt and nxt is not skipped:
         return f"Skipped **{skipped.title}**. Now playing **{nxt.title}**."
     return f"Skipped **{skipped.title}**. Queue's empty."
+
+
+@command(
+    name="restart_song",
+    description="Play the current track again from the start",
+    risk=Risk.WRITE,
+    permission=Perm.CONNECT,
+    aliases=("replay", "restart_track", "start_over"),
+    examples=("restart the song", "play this from the beginning",
+              "start the song over"),
+)
+async def restart_song(ctx: CommandContext) -> str:
+    player_mgr = ctx.extras.get("player")
+    if player_mgr is None:
+        return "Music support isn't loaded."
+    player = player_mgr.get(ctx.guild_id)
+    if not player or not player.playing:
+        return "Nothing is playing."
+    track = await player_mgr.restart(ctx.guild_id)
+    if track is None:
+        return "I couldn't restart that one."
+    return f"Back to the start of **{track.title}**."
 
 
 @command(
@@ -226,9 +343,61 @@ async def nowplaying_music(ctx: CommandContext) -> Any:
     player = player_mgr.get(ctx.guild_id) if player_mgr else None
     if not player or not player.current:
         return "Nothing is playing."
-    embed = track_embed(player.current)
+    embed = track_embed(player.current, guild_id=ctx.guild_id, player=player,
+                        video=video_ok(ctx.extras.get("features"),
+                                       ctx.guild_id, player.current),
+                        status=video_status(ctx.extras, ctx.guild_id))
     embed.add_field("Elapsed", format_duration(player.elapsed), inline=True)
     return embed
+
+
+@command(
+    name="pause_music",
+    description="Pause the current track",
+    risk=Risk.WRITE,
+    permission=Perm.CONNECT,
+    aliases=("pause",),
+    examples=("pause the music", "pause this song"),
+)
+async def pause_music(ctx: CommandContext) -> str:
+    player_mgr = ctx.extras.get("player")
+    player = player_mgr.get(ctx.guild_id) if player_mgr else None
+    if not player or not player.current:
+        # "Pause" with an episode on means the episode.
+        videos = ctx.extras.get("videos")
+        if videos is not None and videos.playing(ctx.guild_id) is not None:
+            from .video_cmds import video_pause
+
+            return await video_pause(ctx, action="pause")
+        return "Nothing is playing."
+    if player.paused:
+        return "Already paused. Say “resume” to carry on."
+    player_mgr.toggle_pause(ctx.guild_id)
+    return f"Paused **{player.current.title}**."
+
+
+@command(
+    name="resume_music",
+    description="Resume the paused track",
+    risk=Risk.WRITE,
+    permission=Perm.CONNECT,
+    aliases=("resume", "unpause"),
+    examples=("resume the music", "unpause", "keep playing"),
+)
+async def resume_music(ctx: CommandContext) -> str:
+    player_mgr = ctx.extras.get("player")
+    player = player_mgr.get(ctx.guild_id) if player_mgr else None
+    if not player or not player.current:
+        videos = ctx.extras.get("videos")
+        if videos is not None and videos.playing(ctx.guild_id) is not None:
+            from .video_cmds import video_pause
+
+            return await video_pause(ctx, action="resume")
+        return "Nothing is playing."
+    if not player.paused:
+        return "It isn't paused."
+    player_mgr.toggle_pause(ctx.guild_id)
+    return f"Resumed **{player.current.title}**."
 
 
 @command(

@@ -160,7 +160,9 @@ async def radio(ctx: CommandContext, channel: Optional[str] = None) -> Any:
 
         voice.watch(ctx.guild_id, asyncio.create_task(
             _watch_tracks(voice, adapter, ctx.guild_id, target)))
-        if track:
+        # Asked from the voice channel's own chat: the reply below already
+        # names the track there, and posting the card too was a duplicate.
+        if track and str(ctx.channel.id) != str(target):
             try:
                 from ..core.context import Response
 
@@ -183,12 +185,18 @@ async def radio(ctx: CommandContext, channel: Optional[str] = None) -> Any:
     risk=Risk.WRITE,
     permission=Perm.CONNECT,
     aliases=("leave_voice", "stop_playing", "disconnect_voice"),
-    examples=("stop the radio", "leave the voice channel"),
+    examples=("stop the radio", "leave the voice channel", "leave the vc",
+              "get out of vc"),
 )
 async def stop_radio(ctx: CommandContext) -> str:
     voice = ctx.extras.get("voice")
     if voice is None:
         return "Voice support isn't loaded."
+    if voice.get(ctx.guild_id) is not None:
+        # Imported here: voicechat_cmds imports this module.
+        from .voicechat_cmds import say_goodbye
+
+        await say_goodbye(ctx)
     if await voice.disconnect(ctx.guild_id):
         failed = voice.teardown_failures(ctx.guild_id)
         if "leave voice channel" in failed or "disconnect" in failed:

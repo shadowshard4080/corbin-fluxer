@@ -6,6 +6,8 @@ logging.getLogger("corbin").setLevel(logging.CRITICAL)
 
 from _harness import Results, run
 
+from corbin.core.permissions import Perm
+
 from corbin.core.ranking import (ROLE_TIERS, RankingStore, UserRank,
                                  XPAccumulator, calculate_level, next_role,
                                  role_for_level, sanitize_id, xp_for_level,
@@ -134,6 +136,19 @@ def suite_accumulator(r: Results) -> None:
         r.ok("level-up detected", acc4.pop_level_up() is not None)
         r.check("level-up is one-shot", acc4.pop_level_up(), None)
 
+        # flush_due can level several people at once; a single slot kept
+        # only the last one and the others were never announced.
+        acc5 = XPAccumulator(store, window=9999.0)
+        for uid in ("q1", "q2"):
+            u = store.get("g", uid); u.chat_xp = 99; store.save("g", u)
+            acc5.record("g", uid, "word " * 10)
+        acc5.flush_all()
+        first, second = acc5.pop_level_up(), acc5.pop_level_up()
+        r.check("simultaneous level-ups all kept",
+                {first and first[0][1], second and second[0][1]},
+                {"q1", "q2"})
+        r.check("queue drains", acc5.pop_level_up(), None)
+
 
 def suite_confirm_phrasing(r: Results) -> None:
     import corbin.commands.moderation  # noqa: F401  (for the fallback case)
@@ -201,11 +216,11 @@ def suite_level_up_card(r: Results) -> None:
 
     entry = UserRank("1", chat_xp=250_000, total_messages=4321,
                      vc_seconds=3 * 3600 + 25 * 60)
-    e = level_up_embed("Sam", entry, avatar_url="https://a/x.png")
+    e = level_up_embed("Lux", entry, avatar_url="https://a/x.png")
     names = [f.name for f in e.fields]
     r.check("titled like the Discord card", e.title,
-            "🏆 Sam has ranked up.")
-    r.check("carries the configured image", e.image_url, LEVEL_UP_GIF)
+            "🏆 Lux has ranked up.")
+    r.check("carries the wolf GIF", e.image_url, LEVEL_UP_GIF)
     r.check("and the avatar", e.thumbnail_url, "https://a/x.png")
     r.check("the Discord fields, in order", names,
             ["Level:", "Current role:", "Total XP:", "Total messages sent:",
@@ -213,7 +228,7 @@ def suite_level_up_card(r: Results) -> None:
     r.check("voice time as hours and minutes", e.fields[-1].value, "3h 25m")
     r.check("level matches the entry", e.fields[0].value, str(entry.level))
 
-    quiet = level_up_embed("Sam", UserRank("1", chat_xp=500),
+    quiet = level_up_embed("Lux", UserRank("1", chat_xp=500),
                            new_title=True)
     r.ok("no voice time, no voice field",
          "Total VC time:" not in [f.name for f in quiet.fields])
@@ -235,8 +250,149 @@ def suite_level_up_card(r: Results) -> None:
     r.ok("junk bytes are rejected", average_colour(b"nope") is None)
 
 
+def suite_custom_roles(r: Results) -> None:
+    """Per-server rank roles (RankRoles + the commands)."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from corbin.commands import ranking_cmds as R
+    from corbin.core.context import (Channel, CommandContext, Guild, Member,
+                                     Platform, Surface, User)
+    from corbin.core.ranking import MAX_TIERS, RankRoles
+    from corbin.core.settings import ChatSettings
+
+    with tempfile.TemporaryDirectory() as tmp:
+        cs = ChatSettings(Path(tmp) / "c.json")
+        roles = RankRoles(cs)
+        r.check("a new server has the defaults", roles.tiers("g"),
+                ROLE_TIERS)
+        r.ok("...and isn't marked custom", not roles.custom("g"))
+        r.check("default title", roles.role_for("g", 30), "Moongazer")
+
+        r.check("renaming returns the old name",
+                roles.set("g", 25, "Moon Child"), "Moongazer")
+        r.check("the new name is used", roles.role_for("g", 30),
+                "Moon Child")
+        r.check("colour kept on rename", roles.tiers("g")[25][1],
+                ROLE_TIERS[25][1])
+        r.ok("the old name is still stripped on sync",
+             "Moongazer" in roles.all_names("g"))
+        r.check("other servers untouched", roles.role_for("h", 30),
+                "Moongazer")
+
+        roles.set("g", 10, "Pup", 0xFFAA00)
+        r.check("a new tier in between", roles.role_for("g", 12), "Pup")
+        r.check("next role sees it",
+                next_role(5, roles.tiers("g")), (10, "Pup"))
+        r.raises("level 0 refused", ValueError, roles.set, "g", 0, "X")
+        r.raises("a blank name refused", ValueError, roles.set, "g", 2, " ")
+        r.raises("the same name at two levels refused", ValueError,
+                 roles.set, "g", 3, "pup")
+        r.raises("@everyone refused", ValueError, roles.set, "g", 3,
+                 "@everyone")
+
+        r.check("remove returns the name", roles.remove("g", 500),
+                "Lord of Eternal Night")
+        r.check("removing nothing", roles.remove("g", 499), None)
+        r.check("top tier is now 250", roles.role_for("g", 9999),
+                "Eternal Legend")
+        r.ok("a removed tier is stripped too",
+             "Lord of Eternal Night" in roles.all_names("g"))
+
+        roles.set("g", 25, "Moongazer")
+        r.ok("renaming back un-retires it",
+             roles.all_names("g").count("Moongazer") == 1)
+
+        again = RankRoles(ChatSettings(Path(tmp) / "c.json"))
+        r.check("survives a restart", again.role_for("g", 12), "Pup")
+
+        roles.reset("g")
+        r.check("reset: defaults again", roles.tiers("g"), ROLE_TIERS)
+        r.ok("reset: custom names still stripped",
+             "Pup" in roles.all_names("g"))
+
+        for lvl in range(1, MAX_TIERS + 1):
+            roles.set("full", 900 + lvl, f"T{lvl}") \
+                if len(roles.tiers("full")) < MAX_TIERS else None
+        r.raises("tier cap", ValueError, roles.set, "full", 999, "One more")
+
+        cs.store.set("bad", RankRoles.KEY, {"tiers": {"5": "oops"}})
+        r.check("a malformed tier is skipped, not fatal",
+                roles.tiers("bad"), {})
+
+        # The commands, with a fake adapter that records role creation.
+        made = []
+
+        class _Adapter:
+            async def ensure_rank_roles(self, gid, tiers):
+                made.append(dict(tiers))
+                return {}, []
+
+            async def role_index(self, gid):
+                return {"777": SimpleNamespace(name="Elder")}
+
+        class _R:
+            async def send(self, *a, **k):
+                return None
+
+        ctx = CommandContext(
+            platform=Platform.FLUXER, surface=Surface.AI,
+            invoker=Member(user=User(id="u", name="Admin"), guild_id="s"),
+            channel=Channel(id="c", name="general", guild_id="s",
+                            is_dm=False),
+            guild=Guild(id="s", name="Den"), responder=_R(),
+            extras={"settings": cs, "rank_roles": roles,
+                    "adapter": _Adapter()})
+        run_ = asyncio.run
+        out = run_(R.rank_role_set(ctx, 50, "<@&777>", "#C0C0C0"))
+        r.ok("a role mention adopts that role by name",
+             "**Elder**" in out and roles.role_for("s", 50) == "Elder")
+        r.check("its colour", roles.tiers("s")[50][1], 0xC0C0C0)
+        r.check("the role is created right away", made[-1],
+                {50: ("Elder", 0xC0C0C0)})
+        r.ok("a bad colour is explained",
+             "colour" in run_(R.rank_role_set(ctx, 5, "X", "purple")))
+        r.ok("remove", "no longer" in run_(R.rank_role_remove(ctx, 50)))
+        listing = run_(R.rank_roles(ctx))
+        r.ok("the list shows the server's tiers",
+             "Silver Warrior" not in listing.description
+             and "One of No Renown" in listing.description)
+        r.ok("reset", "defaults" in run_(R.rank_roles_reset(ctx)))
+
+    from corbin.core.registry import registry
+    specs = {s.name: s for s in registry.ai_invocable()}
+    for name in ("rank-role-set", "rank-role-remove", "rank-roles-reset"):
+        r.ok(f"{name} needs Manage Server",
+             specs[name].permission == Perm.MANAGE_GUILD)
+    r.ok("listing is for everyone",
+         specs["rank-roles"].permission == Perm.NONE)
+    r.ok("every example is on topic",
+         all(specs[n].on_topic(e) for n in ("rank-roles", "rank-role-set",
+                                            "rank-role-remove",
+                                            "rank-roles-reset")
+             for e in specs[n].examples))
+
+    src = (Path(__file__).resolve().parent.parent / "bot.py").read_text(
+        encoding="utf-8")
+    body = src[src.index("async def _announce_level_up"):]
+    body = body[:body.index("\n    def ", 10)]
+    r.ok("level-ups use the server's tiers",
+         "rank_roles.role_for(event_guild" in body
+         and "rank_roles.all_names(event_guild)" in body
+         and "ROLE_TIERS" not in body)
+    # XP is batched, so the message that flushes a level-up is often
+    # someone else's. Without a lookup the card went out as "Someone has
+    # ranked up." with no avatar.
+    r.ok("level-up card looks up a member who isn't the author",
+         "adapter.user_avatar_url(user_id)" in body
+         and "adapter.member_nick(event_guild, user_id)" in body)
+    r.ok("every queued level-up is announced",
+         "while True:" in body and "xp.pop_level_up()" in body)
+
+
 SUITES = [
     ("ranking formulas", suite_formulas),
+    ("custom rank roles", suite_custom_roles),
     ("channel resolution", suite_channel_resolution),
     ("confirm phrasing", suite_confirm_phrasing),
     ("rank progress", suite_progress),

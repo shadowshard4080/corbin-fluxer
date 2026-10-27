@@ -24,8 +24,11 @@ import logging
 import re
 from collections import deque
 from pathlib import Path
-from typing import Any, Deque, Iterable, Optional, Sequence
+from typing import (AbstractSet, Any, Callable, Deque, Iterable, Optional,
+                    Sequence)
 
+from corbin.core.link_previews import prompt_block as link_prompt_block
+from corbin.core.link_previews import render_inline
 from corbin.identity import NAME as BOT_NAME
 
 logger = logging.getLogger("corbin.conversation")
@@ -38,6 +41,43 @@ CHANNEL_HISTORY = 25
 #: Per-user back-and-forth retained across turns.
 USER_HISTORY_TURNS = 12
 MAX_TOKENS_REPLY = 4096
+#: Where he is, stated flatly and with the negation: models know Discord
+#: far better than Fluxer, and a passive "you are on Fluxer" loses to
+#: that -- he starts explaining that "Discord blocks the assignment" on a
+#: server that has no Discord in it.
+PLATFORM_LINE = ("You are on Fluxer, a chat app. This is NOT Discord. "
+                 "Never say Discord, or refer to Discord features, rules or "
+                 "limits, unless someone else brings it up first.")
+PLATFORM_BLOCK = "## Current Context\n" + PLATFORM_LINE
+#: Added to the Current Context only in servers where the owner allowlisted
+#: ``streaming``. The command list is in no prompt, so without this he
+#: answered "what do you have streaming on tv" with "Nothing streaming
+#: right now." Per server, so he never offers it where it would be refused.
+STREAMING_LINE = (
+    "In this server you can stream video into its voice channels: live TV "
+    "(thousands of channels, by category, country or language; people ask "
+    "what's on, or to put a channel on) and the music video of the song "
+    "that's playing (📺 on the Now Playing card, or \"stream the video\"), "
+    "and episodes and films from your own video library (\"what videos do "
+    "you have?\", \"watch episode 1 of a show\"). Not any other video. "
+    "Viewers click your tile to watch.")
+#: The same, where the server's admins turned live TV off: he mustn't
+#: offer a channel the command would then refuse.
+STREAMING_LINE_NO_TV = (
+    "In this server you can stream the music video of the song that's "
+    "playing into its voice channel (📺 on the Now Playing card, or "
+    "\"stream the video\"). Live TV is turned off here by the server's "
+    "admins. Viewers click your tile to watch.")
+#: Appended to a voice-chat turn. Speech is slow to generate and slower
+#: to sit through, and markdown or emoji read aloud is noise.
+SPOKEN_NOTE = ("[This was said out loud in a voice channel and your answer "
+               "will be spoken. Reply in the language they spoke, in one to "
+               "three short sentences of plain speech: no markdown, lists, "
+               "emoji or links. Write numbers and units out as words. The "
+               "words came through speech recognition, so a misheard word "
+               "is likely; go with the obvious meaning. You can caw: write "
+               "*caw* and a real raven call plays there. Rarely, and only "
+               "when it fits.]")
 
 _MENTION = re.compile(r"<@!?(\d+)>")
 _ROLE_MENTION = re.compile(r"<@&(\d+)>")
@@ -332,6 +372,11 @@ class Conversation:
                                if additions_path else "")
         #: Sent instead of SOUL.md to a model with its own baked persona.
         self.compact_rules = COMPACT_RULES
+        #: guild_id -> the owner-allowlisted features on there
+        #: (``FeatureAllowlist.enabled``). Set by the bot; None means none.
+        self.features: Optional[Callable[[Optional[str]], AbstractSet[str]]] = None
+        #: guild_id -> live TV not turned off there
+        self.tv_enabled: Optional[Callable[[str], bool]] = None
         #: channel -> entries. Dicts, not tuples: presence needs timestamps
         #: (30-minute freshness) and a bot flag (never reply to yourself).
         self._channels: dict[str, Deque[dict]] = {}
@@ -355,7 +400,8 @@ class Conversation:
     def record(self, channel_id: str, speaker: str, content: str, *,
                is_bot: bool = False, message_id: Optional[str] = None,
                user_id: Optional[str] = None,
-               media: Sequence[str] = ()) -> dict:
+               media: Sequence[str] = (),
+               previews: Sequence[str] = ()) -> dict:
         """Append one line to a channel transcript.
 
         Recorded when there is text **or** media. An image with no
@@ -370,6 +416,9 @@ class Conversation:
             "author": speaker,
             "content": content.strip(),
             "media": media,
+            # Link previews: rendered only where he is writing a reply
+            # (see corbin/core/link_previews.py).
+            "previews": [str(p) for p in previews if str(p).strip()],
             "is_bot": is_bot,
             "message_id": message_id,
             "user_id": user_id,
@@ -379,6 +428,30 @@ class Conversation:
                                         deque(maxlen=CHANNEL_HISTORY))
         buf.append(entry)
         return entry
+
+    def find(self, channel_id: str, message_id: Optional[str]
+             ) -> Optional[dict]:
+        """The stored entry for one message, or None."""
+        if not message_id:
+            return None
+        for entry in reversed(self._channels.get(channel_id, ())):
+            if entry.get("message_id") == str(message_id):
+                return entry
+        return None
+
+    def set_previews(self, channel_id: str, message_id: Optional[str],
+                     previews: Sequence[str]) -> bool:
+        """Attach link previews that loaded after the message arrived.
+
+        Fluxer unfurls a link a second or so later, as a message update,
+        so most previews reach the entry this way, not via ``record``.
+        """
+        entry = self.find(channel_id, message_id)
+        cleaned = [str(p) for p in previews if str(p).strip()]
+        if entry is None or not cleaned:
+            return False
+        entry["previews"] = cleaned
+        return True
 
     def entries(self, channel_id: str) -> list[dict]:
         return list(self._channels.get(channel_id, ()))
@@ -417,6 +490,9 @@ class Conversation:
                 # say "you posted a picture, I can't see it" instead of
                 # inventing what is in it.
                 line += f" [posted {label}, which you cannot see]"
+            # Only reply() calls this, so previews reach him only when he
+            # is answering.
+            line += render_inline(entry.get("previews") or ())
             if highlight is not None and entry["content"] == highlight:
                 line += "   <<< YOU ARE REPLYING TO THIS MESSAGE"
             lines.append(line)
@@ -437,10 +513,27 @@ class Conversation:
 
     # -- prompting --------------------------------------------------------
 
+    def standalone_system(self) -> str:
+        """The persona plus the platform block, for prompts that don't go
+        through :meth:`system_prompt` (presence chime-ins, musings).
+
+        Those prompts once sent the persona with no "you are on Fluxer"
+        block, so he guessed, and sometimes guessed Discord. A model with
+        its persona baked in gets the compact rules instead of the
+        persona file, as in :meth:`system_prompt`.
+        """
+        if self.soul and not getattr(self.llm, "persona_baked_in", False):
+            parts = [self.soul]
+        else:
+            parts = [self.compact_rules] if self.compact_rules else []
+        parts += [self.soul_additions, PLATFORM_BLOCK]
+        return "\n\n".join(p for p in parts if p)
+
     def system_prompt(self, *, guild_name: Optional[str],
                       channel_name: Optional[str],
                       speaker: str,
                       known_names: Sequence[str] = (),
+                      guild_id: Optional[str] = None,
                       include_soul: bool = True,
                       memory_block: str = "",
                       channel_context: str = "") -> str:
@@ -460,19 +553,15 @@ class Conversation:
         # Additions go to every provider, baked persona or not.
         if self.soul_additions:
             parts.append(self.soul_additions)
-        # Stated flatly, and with the negation: models know Discord far
-        # better than Fluxer, and a passive "you are on Fluxer" loses to
-        # that -- he starts explaining that "Discord blocks the
-        # assignment" on a server that has no Discord in it.
-        context = ["## Current Context",
-                   "You are on Fluxer, a chat app. This is NOT Discord. "
-                   "Never say Discord, or refer to Discord features, "
-                   "rules or limits, unless someone else brings it up "
-                   "first."]
+        # See PLATFORM_LINE for why it's worded this way.
+        context = ["## Current Context", PLATFORM_LINE]
         if guild_name:
             context.append(f"Server: {guild_name}")
         if channel_name:
             context.append(f"Channel: #{channel_name}")
+        if "streaming" in self._features(guild_id):
+            context.append(STREAMING_LINE if self._tv_on(guild_id)
+                           else STREAMING_LINE_NO_TV)
         context.append(f"The person addressing you is: {speaker}")
         if known_names:
             context.append("People present: " + ", ".join(known_names))
@@ -504,6 +593,27 @@ class Conversation:
                 f"{channel_context}")
         return "\n\n".join(p for p in parts if p.strip())
 
+    def _tv_on(self, guild_id: Optional[str]) -> bool:
+        """Live TV not switched off by the server (``tv_enabled``, set by
+        bot.py from TVRules). A failed lookup reads as on: the command
+        still refuses, so the worst case is an offer it then declines."""
+        check = getattr(self, "tv_enabled", None)
+        if check is None or not guild_id:
+            return True
+        try:
+            return bool(check(str(guild_id)))
+        except Exception:
+            return True
+
+    def _features(self, guild_id: Optional[str]) -> AbstractSet[str]:
+        if self.features is None or not guild_id:
+            return frozenset()
+        try:
+            return self.features(str(guild_id))
+        except Exception:
+            logger.exception("feature lookup failed for guild %s", guild_id)
+            return frozenset()
+
     def build_messages(self, *, user_id: str, user_content: str,
                        channel_id: str) -> list[dict]:
         """Assemble the message list, guaranteeing no empty turns."""
@@ -532,7 +642,11 @@ class Conversation:
                     images: Sequence[dict] = (),
                     files: Sequence[tuple] = (),
                     tools: Optional[list] = None,
-                    reference: Optional[str] = None) -> Any:
+                    reference: Optional[str] = None,
+                    set_aside: Optional[str] = None,
+                    spoken: bool = False,
+                    link_previews: Sequence[str] = (),
+                    store: bool = True) -> Any:
         """Generate one conversational reply, or None to stay quiet.
 
         ``images`` are image blocks (``core.vision.image_block``). They are
@@ -547,6 +661,22 @@ class Conversation:
 
         ``files`` are ``(filename, text)`` pairs from attached text files
         and documents.
+
+        ``set_aside`` is ``command_help.set_aside``: a command the message
+        mentioned but wasn't read as asking for. Not stored either.
+
+        ``spoken`` marks a turn heard in voice chat, whose answer will be
+        read aloud. The model is told so for this call only; the note is
+        not stored, like ``reference``.
+
+        ``link_previews`` is what Fluxer unfurled from links in the message
+        being answered (``core.link_previews``). Payload only, never stored.
+
+        ``store=False`` returns the text without remembering the turn or
+        extracting memory from it; the caller does that with
+        :meth:`commit` if it ends up using the reply. Voice chat writes a
+        reply while the command check is still running, and must be able
+        to throw it away without a trace when the words were a command.
         """
         if not has_content(user_content) and images:
             # An image with no caption is still something to answer.
@@ -569,10 +699,20 @@ class Conversation:
             from corbin.ai.command_help import reference_block
 
             payload = f"{payload}\n\n{reference_block(reference)}"
+        if set_aside:
+            from corbin.ai.command_help import set_aside_block
+
+            payload = f"{payload}\n\n{set_aside_block(set_aside)}"
         if files:
             from corbin.core.documents import prompt_block
 
             payload = f"{payload}\n\n{prompt_block(files)}"
+        if link_previews:
+            # Payload only: commit() stores user_content, so the preview
+            # never enters history as if the member had typed it.
+            payload = f"{payload}\n\n{link_prompt_block(link_previews)}"
+        if spoken:
+            payload = f"{payload}\n\n{SPOKEN_NOTE}"
         messages = self.build_messages(
             user_id=user_id, user_content=payload, channel_id=channel_id)
 
@@ -597,7 +737,7 @@ class Conversation:
         system = self.system_prompt(
             guild_name=guild_name, channel_name=channel_name,
             speaker=speaker, known_names=known_names,
-            memory_block=memory_block,
+            guild_id=guild_id, memory_block=memory_block,
             channel_context=self.transcript(channel_id,
                                             omit_latest=user_content),
             include_soul=not getattr(self.llm, "persona_baked_in", False))
@@ -666,6 +806,15 @@ class Conversation:
                 else "model returned empty text")
             return None
 
+        if store:
+            self.commit(user_id=user_id, speaker=speaker, guild_id=guild_id,
+                        user_content=user_content, text=text, files=files)
+        return text
+
+    def commit(self, *, user_id: str, speaker: str,
+               guild_id: Optional[str], user_content: str, text: str,
+               files: Sequence[tuple] = ()) -> None:
+        """Remember one exchange and extract memory from it."""
         # Store the user's actual words, never the injected reference or
         # file contents -- only a note that a file was there.
         stored = user_content
@@ -687,13 +836,16 @@ class Conversation:
                 user_id=user_id, display_name=speaker,
                 guild_id=guild_id, user_content=user_content,
                 bot_response=text, recent=prior))
-        return text
 
     async def _remember(self, *, user_id: str, display_name: str,
                         guild_id: Optional[str], user_content: str,
                         bot_response: str,
                         recent: Sequence[dict] = ()) -> None:
         """Extract and persist durable facts from one exchange."""
+        # "Don't remember me": no extraction call at all, so nothing of
+        # theirs reaches a model for memory, server facts included.
+        if self.memory.is_opted_out(user_id):
+            return
         try:
             entry = self.memory.get_user(user_id)
             user_facts, server_facts = await self.extractor.extract(

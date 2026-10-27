@@ -113,7 +113,7 @@ class MemoryExtractor:
             result = await self.llm.call(
                 model=constants.MODEL_FAST,
                 messages=[{"role": "user", "content": prompt}],
-                max_tokens=MAX_TOKENS, temperature=0.0,
+                max_tokens=MAX_TOKENS, temperature=0.0, structured=True,
             )
         except Exception:
             logger.exception("memory extraction failed")

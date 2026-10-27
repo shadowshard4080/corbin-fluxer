@@ -36,6 +36,18 @@ class GuildPlayer:
     loop_track: bool = False
     loop_queue: bool = False
     started_at: float = 0.0
+    #: When the current pause began (0 = not paused), and how long earlier
+    #: pauses lasted, so ``elapsed`` doesn't count time spent paused.
+    paused_at: float = 0.0
+    paused_total: float = 0.0
+    #: Bumped on every playback attempt. A finish callback carries the
+    #: number it was started with, and a stale one is ignored: when a
+    #: dead stream is retried, the first attempt's "finished" used to
+    #: start the NEXT song too, and post a second Now Playing card.
+    generation: int = 0
+    #: (id of track, channel) of the last card posted, so the same track
+    #: is never announced twice in one channel.
+    last_card: tuple = ()
     #: Set while a track is being advanced, so two finishes cannot race.
     advancing: bool = False
     announce_to: Optional[str] = None
@@ -45,8 +57,21 @@ class GuildPlayer:
         return self.current is not None
 
     @property
+    def paused(self) -> bool:
+        return bool(self.paused_at)
+
+    @property
     def elapsed(self) -> float:
-        return (time.monotonic() - self.started_at) if self.started_at else 0.0
+        if not self.started_at:
+            return 0.0
+        now = time.monotonic()
+        held = self.paused_total + ((now - self.paused_at)
+                                    if self.paused_at else 0.0)
+        return max(0.0, now - self.started_at - held)
+
+    def mark_started(self) -> None:
+        self.started_at = time.monotonic()
+        self.paused_at = self.paused_total = 0.0
 
     def add(self, track: Track) -> bool:
         if len(self.queue) >= MAX_QUEUE:
@@ -90,6 +115,19 @@ class PlayerManager:
         self._locks: dict[str, asyncio.Lock] = {}
         #: Background playlist imports, one per guild. Cancelled by stop.
         self._imports: dict[str, asyncio.Task] = {}
+        #: ``hook(guild_id, track)`` as soon as a track's audio starts, and
+        #: ``hook(guild_id)`` when the queue runs out. The music video
+        #: follows the queue through these. Run as tasks: a hook that
+        #: fetches a video must never hold up the next song.
+        self.on_track_started: list[Callable[..., Awaitable[Any]]] = []
+        self.on_queue_end: list[Callable[..., Awaitable[Any]]] = []
+
+    def _fire(self, hooks: list, *args: Any) -> None:
+        for hook in hooks:
+            try:
+                asyncio.get_running_loop().create_task(hook(*args))
+            except Exception:
+                logger.debug("player hook failed to start", exc_info=True)
 
     def player(self, guild_id: str) -> GuildPlayer:
         return self._players.setdefault(str(guild_id),
@@ -140,18 +178,39 @@ class PlayerManager:
             return f"I couldn't join voice: {exc}"
 
         attempt = 0
+        from .relay import RELAY
+
         while True:
+            # Through the range relay: YouTube paces one long download of
+            # a song's audio to ~playback speed (below it from the
+            # server), ranges go full speed. See corbin/core/relay.py.
             source = FFmpegPCMAudio(
-                track.url, before_options=STREAM_BEFORE_OPTIONS,
+                RELAY.wrap(track.url), before_options=STREAM_BEFORE_OPTIONS,
                 options=STREAM_OPTIONS)
             player.current = track
-            player.started_at = time.monotonic()
+            player.mark_started()
+            player.generation += 1
+            gen = player.generation
+            asked = time.monotonic()
             try:
                 await session.client.play(
-                    source, after=lambda _e: self._schedule_advance(guild_id))
+                    source,
+                    after=lambda _e, g=gen: self._schedule_advance(guild_id,
+                                                                   g))
+                if time.monotonic() - asked > 2.0:
+                    # play() first stops the old track, which is where a
+                    # wedged unpublish used to hang ⏮️ forever.
+                    logger.warning("starting %r took %.1fs (stopping the "
+                                   "previous audio was slow)", track.title,
+                                   time.monotonic() - asked)
             except Exception as exc:
                 logger.info("play failed: %s", exc)
                 return f"Playback failed: {exc}"
+            if attempt == 0:
+                # Now, not after the IMMEDIATE_FAIL_SECS check below: the
+                # music video started 4 s+ behind the audio on every song
+                # while it waited (live, 2026-10-17).
+                self._fire(self.on_track_started, guild_id, track)
 
             # Give it long enough to prove it is really playing. A 403 shows
             # up as an immediate, silent finish.
@@ -188,8 +247,18 @@ class PlayerManager:
                                 requester_name=track.requester_name)
         return fresh
 
-    def _schedule_advance(self, guild_id: str) -> None:
-        """``after`` callback: hop back onto the loop to advance."""
+    def _schedule_advance(self, guild_id: str,
+                          generation: Optional[int] = None) -> None:
+        """``after`` callback: hop back onto the loop to advance.
+
+        Ignored when ``generation`` is no longer current: that attempt was
+        replaced (a retry, a skip, a new song) and is not "the track
+        finished".
+        """
+        player = self.get(guild_id)
+        if (generation is not None and player is not None
+                and generation != player.generation):
+            return
         try:
             asyncio.get_running_loop().create_task(self.advance(guild_id))
         except RuntimeError:
@@ -206,10 +275,62 @@ class PlayerManager:
             if nxt is None or session is None:
                 player.current = None
                 player.started_at = 0.0
+                self._fire(self.on_queue_end, guild_id)
                 return
             await self.play_now(guild_id, session.channel_id, nxt)
         finally:
             player.advancing = False
+
+    def toggle_pause(self, guild_id: str) -> Optional[bool]:
+        """Pause or resume. Returns the new paused state, or None if
+        nothing is playing.
+
+        The voice client's frame loop waits on its resume event before
+        every frame, so pausing simply stops feeding audio. A skip or stop
+        while paused is safe: the client's stop cancels the loop and sets
+        the event again.
+        """
+        player = self.get(guild_id)
+        session = self.voice.get(guild_id)
+        if player is None or player.current is None or session is None:
+            return None
+        client = session.client
+        if player.paused:
+            client.resume()
+            player.paused_total += time.monotonic() - player.paused_at
+            player.paused_at = 0.0
+            return False
+        client.pause()
+        player.paused_at = time.monotonic()
+        return True
+
+    async def restart(self, guild_id: str) -> Optional[Track]:
+        """Play the current track again from the start. None if nothing
+        is playing (or it couldn't be restarted).
+
+        Asked for so a music video can start with its song: the audio
+        begins before the video can. The video restarts with it through
+        ``on_track_started``.
+        """
+        began = time.monotonic()
+        async with self.lock(guild_id):
+            player = self.get(guild_id)
+            session = self.voice.get(guild_id)
+            if player is None or player.current is None or session is None:
+                return None
+            track = player.current
+            logger.info("restarting %r in guild %s", track.title, guild_id)
+            if player.paused:
+                session.client.resume()
+            failure = await self.play_now(guild_id, session.channel_id,
+                                          track, announce=False)
+            logger.info("restart of %r %s in %.1fs", track.title,
+                        "failed" if failure else "done",
+                        time.monotonic() - began)
+            if failure:
+                logger.info("restart of %r failed: %s", track.title, failure)
+                return None
+            return track
 
     async def skip(self, guild_id: str) -> Optional[Track]:
         async with self.lock(guild_id):

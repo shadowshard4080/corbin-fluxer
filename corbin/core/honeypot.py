@@ -58,12 +58,11 @@ NOTICE_BODY = (
 )
 
 
-def is_exempt(member: Any, *, bot_owner_id: Optional[str] = None) -> bool:
-    """Staff and the bot owner get a nudge instead of a ban."""
+def is_exempt(member: Any) -> bool:
+    """Staff get a nudge instead of a ban. The bot owner is treated like
+    anyone else in the server: staff there, or not."""
     if member is None:
         return True  # unknown member: never ban on a guess
-    if bot_owner_id and str(getattr(member, "id", "")) == str(bot_owner_id):
-        return True
     if getattr(member, "is_guild_owner", False):
         return True
     try:

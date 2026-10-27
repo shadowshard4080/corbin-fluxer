@@ -43,7 +43,20 @@ def suite_heartbeat(r: Results) -> None:
     r.ok("installs onto a real gateway", ping.install(client(gw)))
     r.ok("installing twice is idempotent", ping.install(client(gw)))
 
-    asyncio.run(gw._send_heartbeat())
+    async def beat_and_wait(g, p, timeout=1.0):
+        began = time.monotonic()
+        await g._send_heartbeat()
+        returned = time.monotonic() - began
+        await p.wait(timeout)
+        # let a timed-out ACK task finish too
+        await asyncio.sleep(0)
+        while p._pending:
+            await asyncio.sleep(0.01)
+        return returned
+
+    returned = asyncio.run(beat_and_wait(gw, ping))
+    r.ok("the heartbeat call is not held up by the ACK wait",
+         returned < 0.015)
     r.ok("a round trip is measured", ping.latency is not None)
     r.ok("...and is in the right ballpark", 0.01 < ping.latency < 0.2)
     r.check("the original heartbeat still went out", gw.sends, 1)
@@ -56,12 +69,39 @@ def suite_heartbeat(r: Results) -> None:
         p2 = GatewayPing()
         p2.install(client(dead))
         started = time.monotonic()
-        asyncio.run(dead._send_heartbeat())
+        asyncio.run(beat_and_wait(dead, p2, timeout=0.2))
         waited = time.monotonic() - started
     finally:
         H.ACK_TIMEOUT = saved
     r.check("no ACK reports unknown, not zero", p2.latency, None)
     r.ok("...and gives up at the cap", waited < 0.5)
+
+    # A beat the server asked for comes with the flag already set; timing
+    # it would report ~0 ms.
+    asked = Gateway(0.02)
+    asked._last_heartbeat_ack = True
+    p3 = GatewayPing()
+    p3.install(client(asked))
+    asyncio.run(beat_and_wait(asked, p3, timeout=0.1))
+    r.check("a server-requested beat is not timed", p3.latency, None)
+    r.check("...but still goes out", asked.sends, 1)
+
+    # The boot notice waits for the first reading rather than reading None.
+    later = Gateway(0.02)
+    p4 = GatewayPing()
+    p4.install(client(later))
+
+    async def first_reading():
+        async def beat_soon():
+            await asyncio.sleep(0.05)
+            await later._send_heartbeat()
+        asyncio.get_running_loop().create_task(beat_soon())
+        return await p4.wait(1.0)
+
+    r.ok("wait() returns the first reading", asyncio.run(first_reading())
+         is not None)
+    r.check("wait() gives up as unknown", asyncio.run(GatewayPing().wait(0.05)),
+            None)
 
     r.ok("a client with no gateway is a no-op",
          GatewayPing().install(type("X", (), {})()) is False)

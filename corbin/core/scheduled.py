@@ -100,6 +100,92 @@ def animal_image_url(key: str) -> str:
     return TINYFOX_URL.format(animal=key)
 
 
+#: Everyday names for the tinyfox animals, beyond ``ANIMALS``' own labels.
+#: Singular only; plurals are handled in ``animal_for_query``.
+ANIMAL_ALIASES: dict[str, str] = {
+    "foxes": "fox", "hyena": "yeen", "puppy": "dog", "puppies": "dog",
+    "doggo": "dog", "doggy": "dog", "maned wolf": "guara",
+    "otter": "ott", "goat": "bleat", "wolf": "woof", "wolves": "woof",
+    "african wild dog": "chi", "painted dog": "chi", "cougar": "puma",
+    "mountain lion": "puma", "tiger": "tig", "red panda": "wah",
+    "panda": "wah", "pallas cat": "manul", "pallas's cat": "manul",
+    "snow leopard": "snep", "cheetah": "chee", "raccoon": "racc",
+    "capybara": "capy", "bunny": "bun", "bunnies": "bun", "rabbit": "bun",
+    "snake": "snek", "shiba": "shiba", "shiba inu": "shiba",
+    "ferret": "dook", "lion": "leo", "coyote": "yote", "possum": "poss",
+    "opossum": "poss",
+}
+
+#: Words that don't change *which* picture is wanted. Anything else left
+#: over ("fox in the snow", "fox news logo", "teddy bear") means a
+#: specific image, and that's Google's job, not tinyfox's.
+_IMAGE_FILLER = frozenset((
+    "a", "an", "the", "some", "any", "random", "cute", "adorable", "cool",
+    "nice", "another", "me", "please", "pls", "of", "show", "find", "get",
+    "send", "picture", "pictures", "pic", "pics", "photo", "photos",
+    "image", "images", "imgs", "img"))
+
+
+def animal_for_query(query: str) -> Optional[str]:
+    """The tinyfox key when ``query`` is just asking for one of its
+    animals ("a fox", "cute capybaras", "picture of a snow leopard");
+    None for anything more specific, so it goes to the image search."""
+    words = [w for w in "".join(
+        c if c.isalnum() or c in " '" else " "
+        for c in str(query or "").lower()).split()
+        if w not in _IMAGE_FILLER]
+    text = " ".join(words)
+    if not text:
+        return None
+    names = {label.lower(): key for key, label in ANIMALS.items()}
+    names.update({key: key for key in ANIMALS})
+    names.update(ANIMAL_ALIASES)
+    for candidate in (text, text[:-1] if text.endswith("s") else None,
+                      text[:-2] if text.endswith("es") else None):
+        if candidate and candidate in names:
+            return names[candidate]
+    return None
+
+
+async def fetch_animal(key: str, *, timeout: float = 20.0
+                       ) -> Optional[bytes]:
+    """One tinyfox picture as bytes, or None.
+
+    Bytes, not a URL in an embed: tinyfox serves a different animal on
+    every request, but the URL never changes -- so the CDN caches the
+    first one and every post shows the same wolf.
+    """
+    import httpx
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout,
+                                     follow_redirects=True) as client:
+            resp = await client.get(animal_image_url(key))
+    except Exception as exc:
+        logger.info("tinyfox fetch for %s failed: %s", key,
+                    type(exc).__name__)
+        return None
+    if resp.status_code != 200 or not resp.content:
+        logger.info("tinyfox gave HTTP %s for %s", resp.status_code, key)
+        return None
+    return resp.content
+
+
+async def animal_post(key: str, title: str) -> Optional[Any]:
+    """The hourly-animal post (embed + uploaded picture) as a Response,
+    or None when tinyfox gave nothing. Shared by the hourly job and
+    ``image_search``, so an animal looks the same either way."""
+    from .context import Embed, Response
+
+    picture = await fetch_animal(key)
+    if picture is None:
+        return None
+    return Response(
+        embed=Embed(title=title, footer="Powered by tinyfox.dev",
+                    colour=0x5CB85C),
+        files=((f"{key}.png", picture),))
+
+
 def pick_animal(preferred: Optional[str] = None) -> tuple[str, str]:
     key = resolve_animal(preferred) or random.choice(list(ANIMALS))
     return key, ANIMALS[key]

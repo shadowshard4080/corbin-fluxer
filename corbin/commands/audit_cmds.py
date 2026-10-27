@@ -14,6 +14,17 @@ from ..core.context import CommandContext, Embed
 from ..core.permissions import Perm
 from ..core.registry import Param, Risk, command
 
+#: The router may only run these when server logging is the subject. A bare
+#: "log" is too common: "this is the entire log, can you look for it?" (a
+#: pasted game log) became the audit status card.
+AUDIT_TOPIC = (
+    r"\blogg(?:ing|ed)\b|\baudit|\bmod[- ]?logs?\b|\bserver[- ]?logs?\b"
+    r"|\bevent[- ]?logs?\b|\blog (?:settings|channel|categor)"
+    r"|\b(?:also|start|stop|don'?t|quit) log\b"
+    r"|\blog (?:when|every|all|voice|messages?|members?|channels?|joins?"
+    r"|leaves?|edits?|deletes?|deletions?|people)\b"
+)
+
 
 def _resolve_channel(ctx: CommandContext, value: Optional[str]) -> Optional[str]:
     if not value:
@@ -30,6 +41,7 @@ def _resolve_channel(ctx: CommandContext, value: Optional[str]) -> Optional[str]
     risk=Risk.WRITE,
     permission=Perm.MANAGE_GUILD,
     aliases=("serverlog", "modlog", "setup_logs"),
+    topic=AUDIT_TOPIC,
     params=(
         Param("enabled", "on or off", kind="boolean"),
         Param("channel", "where to post log entries", kind="channel",
@@ -61,6 +73,7 @@ async def audit_logs(ctx: CommandContext, enabled: bool,
     risk=Risk.WRITE,
     permission=Perm.MANAGE_GUILD,
     aliases=("log_category",),
+    topic=AUDIT_TOPIC,
     params=(
         Param("category", "which events", choices=tuple(CATEGORIES)),
         Param("enabled", "on or off", kind="boolean"),
@@ -91,7 +104,9 @@ async def audit_category(ctx: CommandContext, category: str,
     description="Show what server events are being logged",
     risk=Risk.SAFE,
     aliases=("log_status",),
-    examples=("what are you logging", "show the log settings"),
+    topic=AUDIT_TOPIC,
+    examples=("show me the server logs", "what are you logging",
+              "show the log settings"),
 )
 async def audit_status(ctx: CommandContext) -> Any:
     settings = ctx.extras["settings"]

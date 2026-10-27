@@ -9,11 +9,11 @@ from __future__ import annotations
 
 import logging
 
-from ..identity import NAME
 from ..core.context import CommandContext
 from ..core.permissions import Perm
 from ..core.registry import Param, Risk, command
 from ._notify import delivery_note, notify_target
+from ..identity import NAME
 
 logger = logging.getLogger("corbin.moderation")
 
@@ -156,6 +156,11 @@ async def assignrole(ctx: CommandContext, user: str, role: str) -> str:
     if not str(role).isdigit():
         return (f"There's no role called “{role}” here. Check the "
                 "spelling, or give me the role id.")
+    store = ctx.extras.get("reaction_roles")
+    if store is not None and store.is_dm_role(ctx.guild_id, role):
+        return (f"<@&{role}> is an opt-in DM role: people only get it by "
+                "reacting for it themselves, since it puts them on the "
+                "messager's DM list. I can't hand it out.")
     try:
         await adapter.add_role(ctx.guild_id, user, role)
     except Exception as exc:
@@ -217,6 +222,9 @@ async def listbans(ctx: CommandContext):
     description=f"Stop {NAME} conversing with someone (they keep commands)",
     risk=Risk.DESTRUCTIVE,
     owner_only=True,
+    # The list is global and keyed by user id, so it works from a DM too
+    # (by id: with no server, a name can't be looked up).
+    guild_only=False,
     aliases=("mute_corbin", "ignore_user"),
     params=(Param("user", "who", kind="user"),),
     confirm_phrase=lambda a: f"stop talking to {a.get('user')}",
@@ -226,6 +234,12 @@ async def chatban(ctx: CommandContext, user: str) -> str:
     chatbans = ctx.extras.get("chatbans")
     if chatbans is None:
         return "Chatban tracking isn't available."
+    # An unresolved name (always, in a DM) would be stored as-is: an
+    # entry that never matches anyone, reported as a ban.
+    if not str(user).isdigit():
+        where = "" if ctx.guild_id else " (in a DM I can't look names up)"
+        return (f"I couldn't tell who {user!r} is{where}. Give me their "
+                "user id or @mention them.")
     now_banned = chatbans.toggle(user)
     if now_banned:
         return (f"I'll stop replying to <@{user}> in chat. Commands still "

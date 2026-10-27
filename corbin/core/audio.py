@@ -26,6 +26,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
+from .logtext import said
+
 logger = logging.getLogger("corbin.audio")
 
 POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL",
@@ -137,6 +139,17 @@ class Track:
     thumbnail: str = ""
     requested_by: str = ""
     requester_name: str = ""
+    #: The video-only stream from the same extraction (pick_video_from_
+    #: formats), so a music video needs no second lookup: that lookup was
+    #: most of the wait for 📺 on this one-core host (live, 2026-10-17).
+    video_url: str = ""
+    video_headers: dict = field(default_factory=dict)
+    #: The video stream's frame rate, so it's streamed at its own (24 fps
+    #: for Thriller) rather than padded to 30. 0 when unknown.
+    video_fps: float = 0.0
+    #: When this track was extracted (monotonic), so a stale link is
+    #: looked up again rather than used.
+    extracted_at: float = field(default_factory=time.monotonic)
 
     @property
     def pretty_duration(self) -> str:
@@ -159,6 +172,11 @@ def track_from_info(info: dict, *, requested_by: str = "",
                 break
     if not stream:
         return None
+    fmt = pick_video_entry(info)
+    video = None
+    if fmt is not None:
+        video = (str(fmt["url"]), dict(fmt.get("http_headers")
+                                       or info.get("http_headers") or {}))
     thumb = info.get("thumbnail") or ""
     if not thumb:
         thumbs = info.get("thumbnails") or []
@@ -173,7 +191,89 @@ def track_from_info(info: dict, *, requested_by: str = "",
         uploader=str(info.get("uploader") or info.get("channel") or ""),
         thumbnail=str(thumb or ""),
         requested_by=requested_by, requester_name=requester_name,
+        video_url=video[0] if video else "",
+        video_headers=video[1] if video else {},
+        video_fps=float((fmt or {}).get("fps") or 0.0),
     )
+
+
+#: The music video's source. Up to the largest stream size, 1080p (owner,
+#: 2026-10-20; it was 720p while the host had one core), 30 fps at most,
+#: and H.264 first: it's the cheapest to decode. Falls back to any codec,
+#: then to a muxed format (its audio is ignored). A server streaming at
+#: 720p gets the same source scaled down.
+VIDEO_MAX_HEIGHT = 1080
+VIDEO_FORMAT = (f"bestvideo[height<={VIDEO_MAX_HEIGHT}][fps<=30][vcodec^=avc1]/"
+                f"bestvideo[height<={VIDEO_MAX_HEIGHT}][fps<=30]/"
+                f"bestvideo[height<={VIDEO_MAX_HEIGHT}]/"
+                f"best[height<={VIDEO_MAX_HEIGHT}]")
+
+
+def pick_video_from_formats(info: Any) -> Optional[tuple[str, dict]]:
+    """``(url, http_headers)`` of :func:`pick_video_entry`, or None."""
+    fmt = pick_video_entry(info)
+    if fmt is None:
+        return None
+    headers = fmt.get("http_headers") or info.get("http_headers") or {}
+    return str(fmt["url"]), dict(headers)
+
+
+def pick_video_entry(info: Any) -> Optional[dict]:
+    """The music video's stream from an extraction's full format list.
+
+    The same rules as VIDEO_FORMAT: <=1080p, <=30 fps, video-only first,
+    then **plain HTTPS before HLS**, H.264, then the biggest. None when
+    there's no usable video.
+
+    The protocol rank matters: YouTube also lists HLS (m3u8) video-only
+    formats, often with a higher bitrate figure, and ranking on bitrate
+    alone picked one. It opened in 13 s and then fed ffmpeg slower than
+    real time (9 fps sent; live, 2026-10-17). yt-dlp's own selector,
+    which the separate lookup used, ranks https first too.
+    """
+    if not isinstance(info, dict):
+        return None
+    best, best_key = None, None
+    for fmt in info.get("formats") or ():
+        if not isinstance(fmt, dict) or not fmt.get("url"):
+            continue
+        if fmt.get("vcodec") in (None, "none"):
+            continue
+        height = fmt.get("height") or 0
+        if not height or height > VIDEO_MAX_HEIGHT or \
+                (fmt.get("fps") or 30) > 30:
+            continue
+        protocol = str(fmt.get("protocol") or "https")
+        if protocol.startswith(("mhtml", "sabr", "http_dash_segments")):
+            continue
+        rank = 2 if protocol in ("https", "http") else (
+            1 if protocol.startswith("m3u8") else 0)
+        key = (fmt.get("acodec") in (None, "none"), rank,
+               str(fmt.get("vcodec") or "").startswith("avc1"),
+               height, fmt.get("tbr") or 0)
+        if best_key is None or key > best_key:
+            best, best_key = fmt, key
+    if best is None:
+        return None
+    logger.info("music video source for %r: %s %sp %s %s (format %s)",
+                info.get("title") or "?", best.get("vcodec"),
+                best.get("height"), best.get("fps") or "?",
+                best.get("protocol") or "https", best.get("format_id"))
+    return best
+
+
+def pick_video_format(info: Any) -> Optional[tuple[str, dict]]:
+    """``(url, headers)`` of the video part of an extraction, or None."""
+    if not isinstance(info, dict):
+        return None
+    candidates = list(info.get("requested_formats") or []) or [info]
+    for fmt in candidates:
+        vcodec = fmt.get("vcodec")
+        if vcodec in (None, "none") or not fmt.get("url"):
+            continue
+        headers = fmt.get("http_headers") or info.get("http_headers") or {}
+        return str(fmt["url"]), dict(headers)
+    return None
 
 
 class Extractor:
@@ -248,6 +348,28 @@ class Extractor:
         return await asyncio.wait_for(asyncio.to_thread(_run),
                                       timeout=EXTRACT_TIMEOUT)
 
+    async def video_stream(self, page_url: str, *,
+                           clients: Optional[Sequence[str]] = None
+                           ) -> Optional[tuple[str, dict]]:
+        """The video-only stream for a page, for a music video.
+
+        ``(url, http_headers)``, or None when there's no video format (a
+        SoundCloud link, an audio-only upload). YouTube serves 720p as a
+        separate video-only stream anyway, so this is its own extraction
+        with VIDEO_FORMAT. Raises on extraction failure.
+        """
+        import yt_dlp
+
+        def _run() -> dict:
+            opts = self.opts(clients=clients)
+            opts["format"] = VIDEO_FORMAT
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(page_url, download=False)
+
+        info = await asyncio.wait_for(asyncio.to_thread(_run),
+                                      timeout=EXTRACT_TIMEOUT)
+        return pick_video_format(info)
+
     async def resolve(self, query: str, *, requested_by: str = "",
                       requester_name: str = "",
                       allow_playlist: bool = False
@@ -304,7 +426,7 @@ class Extractor:
                     "YouTube is asking me to prove I'm not a bot. That needs "
                     "a PO token provider or fresh cookies on the host; "
                     "switching clients won't fix it.")
-            logger.info("extraction failed for %r: %s", query, message)
+            logger.info("extraction failed for %s: %s", said(query), message)
             return [], "I couldn't find or load that."
 
         entries = info.get("entries") if isinstance(info, dict) else None
@@ -342,7 +464,8 @@ class Extractor:
             try:
                 info = await self.extract(text, playlist=True, flat=True)
             except Exception as exc:
-                logger.info("playlist listing failed for %r: %s", text, exc)
+                logger.info("playlist listing failed for %s: %s", said(text),
+                            exc)
                 return []
             out = []
             for entry in (info or {}).get("entries") or ():

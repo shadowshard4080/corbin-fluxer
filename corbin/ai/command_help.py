@@ -31,13 +31,14 @@ from corbin.core.registry import CommandSpec, Registry
 #: other channels"). A member's overview is ~3K chars; an admin's, with
 #: the staff tools in detail, ~16K; the bot owner's ~16.2K (~4.5K tokens).
 #: It is only ever sent when someone asked, so that is affordable.
-MAX_REFERENCE_CHARS = 17000
+MAX_REFERENCE_CHARS = 28000
 #: Detailed entries returned for a topic lookup.
 MAX_MATCHES = 6
 
 #: Module stem -> the heading people would recognise.
 CATEGORIES = {
     "audit_cmds": "Audit logs",
+    "banner_cmds": "Server banner",
     "config_cmds": "Chat settings",
     "digest_cmds": "Daily digest",
     "expression_cmds": "Emoji and stickers",
@@ -48,12 +49,18 @@ CATEGORIES = {
     "moon_cmds": "Moon",
     "music_cmds": "Music",
     "radio_cmds": "Radio",
+    "reaction_role_cmds": "Reaction roles",
     "ranking_cmds": "Ranking and XP",
     "reminder_cmds": "Reminders",
     "scheduled_cmds": "Scheduled posts",
     "spamblock_cmds": "Spam blocker",
+    "stream_cmds": "Streaming video",
+    "tv_cmds": "Live TV",
     "util_cmds": "Utilities",
     "verse_cmds": "Bible verses",
+    "video_cmds": "Video library",
+    "voicechat_cmds": "Voice chat",
+    "allowlist_cmds": "Feature allowlist",
     "warn_cmds": "Warnings",
     "welcome_cmds": "Welcome and farewell",
 }
@@ -83,7 +90,9 @@ STAFF_NOTES = {
         "chat-mode sets the server-wide mode: mention (only when "
         "mentioned or replied to), global (he may also join conversations "
         "on his own), or off. reply-channel makes one channel answer "
-        "every message; silence mutes him in one channel."),
+        "every message; silence mutes him in a channel (in global mode "
+        "he asks: stop chiming in, or fully silent?); unsilence undoes "
+        "it."),
     "audit_cmds": (
         "audit-logs turns logging on and picks the channel; audit-category "
         "switches single kinds on or off: message edits and deletes, joins "
@@ -114,16 +123,27 @@ STAFF_NOTES = {
         "Copies from a Discord server the bot owner has configured "
         "(DISCORD_TOKEN and DISCORD_GUILD_ID). Needs Manage Expressions."),
     "memory_cmds": "forget-server can't be undone.",
-    "util_cmds": "messager DMs every member of a role; it confirms first.",
+    "util_cmds": "messager DMs only members who opted in to an opt-in DM "
+                 "role by reacting on the reaction roles; it confirms "
+                 "first.",
 }
 
 #: Notes for everyone.
 CATEGORY_NOTES.update({
     "music_cmds": (
         "A YouTube or Spotify playlist or album link queues up to 50 songs: "
-        "the first starts right away and the rest load in the background."),
+        "the first starts right away and the rest load in the background. "
+        "The Now Playing card has reaction buttons (pause/resume, skip, "
+        "stop, loop, shuffle) for anyone in the voice channel."),
+    "verse_cmds": (
+        "Verse cards have reaction buttons to switch between KJV, NASB95 "
+        "and John Gill's Exposition. Hebrew or Greek: just ask."),
     "ranking_cmds": (
         "XP comes from chatting. Time in voice isn't counted on Fluxer yet."),
+    "voicechat_cmds": (
+        "Needs VoiceStudio running on the bot's host. With others in the "
+        "channel, say his name so he knows it's for him. Commands work "
+        "spoken too, like \"play the radio\"."),
 })
 
 #: Things he does without anyone running a command. Asked "what can you
@@ -227,14 +247,12 @@ def category_of(spec: CommandSpec) -> str:
         "_", " ").strip().capitalize() or "Other"
 
 
-#: Permissions every ordinary member has. A command needing only these
-#: (joining voice for music, say) is for everyone, not a staff tool.
-MEMBER_PERMS = (Perm.VIEW_CHANNEL | Perm.SEND_MESSAGES | Perm.CONNECT
-                | Perm.SPEAK | Perm.READ_MESSAGE_HISTORY)
+from corbin.core.permissions import (MEMBER_PERMS,  # noqa: E402,F401
+                                     is_staff_permission)
 
 
 def is_staff(spec: CommandSpec) -> bool:
-    return bool(int(spec.permission) & ~int(MEMBER_PERMS))
+    return is_staff_permission(spec.permission)
 
 
 def perm_label(required: Perm) -> str:
@@ -248,8 +266,13 @@ class CommandHelp:
 
     def __init__(self, registry: Registry, *,
                  bot_owner_id: Optional[str] = None,
-                 grants: Optional[dict[str, AbstractSet[str]]] = None) -> None:
+                 grants: Optional[dict[str, AbstractSet[str]]] = None,
+                 features: Optional[Any] = None) -> None:
         self.registry = registry
+        #: guild id -> features the owner's allowlist turns on there.
+        #: A command with a ``feature`` is hidden wherever it's off, so he
+        #: never offers voice chat in a server that can't use it.
+        self.features = features
         self.bot_owner_id = str(bot_owner_id) if bot_owner_id else None
         self.grants = dict(grants or {})
 
@@ -272,7 +295,9 @@ class CommandHelp:
         """
         if spec.guild_only and not in_guild:
             return "only works in a server, not in DMs"
-        if self._is_owner(invoker) or self._granted(spec, invoker):
+        # No bot-owner pass: the help mirrors risk.assess, which gives
+        # the bot owner no server permissions they don't hold.
+        if self._granted(spec, invoker):
             return None
         effective = getattr(invoker, "permissions", Perm.NONE)
         if not has(effective, spec.permission):
@@ -282,8 +307,18 @@ class CommandHelp:
     def _offered(self, guild_id: Optional[str] = None,
                  owner: bool = False) -> Iterable[CommandSpec]:
         # Owner-only commands are shown to the bot owner and nobody else.
+        # Hidden only when we know which server this is. The dispatcher
+        # refuses them there regardless (risk.assess).
+        gated = guild_id is not None and self.features is not None
+        enabled: AbstractSet[str] = frozenset()
+        if gated:
+            try:
+                enabled = self.features(str(guild_id))
+            except Exception:
+                enabled = frozenset()
         return (s for s in self.registry.ai_invocable()
-                if owner or not s.owner_only)
+                if (owner or not s.owner_only)
+                and not (gated and s.feature and s.feature not in enabled))
 
     # -- rendering ---------------------------------------------------------
 
@@ -394,6 +429,37 @@ class CommandHelp:
         floor = -scored[0][0] / 2
         return [spec for neg, _, spec in scored[:MAX_MATCHES] if -neg >= floor]
 
+    def set_aside(self, spec: CommandSpec, invoker: Any, *, in_guild: bool,
+                  guild_id: Optional[str] = None) -> str:
+        """One command, for a message that mentioned it without asking."""
+        offered = any(s.name == spec.name for s in self._offered(
+            guild_id, owner=self._is_owner(invoker)))
+        if not offered:
+            return (f"- {spec.name}: {spec.description} [not available in "
+                    "this server]")
+        return self._detail(spec, invoker, in_guild)
+
+    def did_you_mean(self, spec: CommandSpec, invoker: Any, *,
+                     in_guild: bool,
+                     guild_id: Optional[str] = None) -> Optional[str]:
+        """The line ending a reply when the classifier guessed at a command
+        but wasn't sure: ``-# Did you mean: "Show me the server logs"?``,
+        in microtext (owner) so it reads as a footnote, not part of his reply.
+
+        The phrase is the command's first example, so it is something that
+        would run it if typed. None when this person couldn't run it here,
+        or it has no example: offering it would just earn a refusal.
+        """
+        if not spec.examples:
+            return None
+        offered = any(s.name == spec.name for s in self._offered(
+            guild_id, owner=self._is_owner(invoker)))
+        if not offered or self.restriction(spec, invoker, in_guild):
+            return None
+        phrase = spec.examples[0].strip()
+        phrase = phrase[:1].upper() + phrase[1:]
+        return f'-# Did you mean: "{phrase}"?'
+
     def lookup(self, topic: str, invoker: Any, *, in_guild: bool,
                guild_id: Optional[str] = None) -> str:
         """The reference block to hand the model."""
@@ -424,6 +490,22 @@ class CommandHelp:
         if len(text) > MAX_REFERENCE_CHARS:
             text = text[:MAX_REFERENCE_CHARS].rsplit("\n", 1)[0] + "\n…"
         return text
+
+
+def set_aside_block(detail: str) -> str:
+    """How a command that was read as mentioned, not requested, is framed."""
+    return (
+        "[Tool:CommandNotRun] This message was read as being about one of "
+        "your real commands, but not as a request to run it right now, so "
+        "nothing ran:\n"
+        f"{detail}\n"
+        "Never claim you can't do this, or that you're text-only. The "
+        "match may be wrong: if the message is really about something "
+        "else (a question, homework, chat), just answer that and don't "
+        "bring the command up. Only if they seem to want it: when it's "
+        "marked unavailable here or as one this person can't run, say "
+        "that plainly; otherwise say you'll do it if they ask you "
+        "outright, in your own words.")
 
 
 def reference_block(reference: str) -> str:

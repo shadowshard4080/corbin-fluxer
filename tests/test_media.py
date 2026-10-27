@@ -32,7 +32,7 @@ class Sticker:
 
 def convo():
     llm = type("L", (), {"constants": type("K", (), {
-        "MODEL_MAIN": "m", "EFFORT_MAIN": "low"})})
+        "MODEL_MAIN": "m", "MODEL_REPLY": "m", "MODEL_THINK": "m", "EFFORT_MAIN": "low"})})
     return Conversation(llm, soul_path="/nonexistent")
 
 
@@ -78,11 +78,11 @@ def suite_emoji(r: Results) -> None:
 def suite_transcript(r: Results) -> None:
     c = convo()
     # The exact case that broke: an image with no caption.
-    entry = c.record("ch", "Riley", "",
+    entry = c.record("ch", "Nightjar", "",
                      media=["an image called landscape.png"])
     r.ok("an image-only message is recorded, not dropped", bool(entry))
 
-    c.record("ch", "Robin", "i dont even know")
+    c.record("ch", "Kit", "i dont even know")
     text = c.transcript("ch")
     r.ok("the picture appears in the transcript", "landscape.png" in text)
     # Without this he describes what he imagines is in it.
@@ -197,7 +197,7 @@ def suite_corbin_emoji(r: Results) -> None:
     from corbin.platforms.fluxer.adapter import FluxerAdapter
     from corbin.core.context import Response
 
-    eid = "111111111111111111"
+    eid = "555555555555555555"
     r.check("the shorthand expands", render("hi :corbin:", eid),
             f"hi <:corbin:{eid}>")
     # The wrong prefix renders as literal text, so this is not cosmetic.

@@ -33,6 +33,12 @@ import test_roles  # noqa: E402
 import test_spotify  # noqa: E402
 import test_status  # noqa: E402
 import test_voice_audio  # noqa: E402
+import test_voicechat  # noqa: E402
+import test_voice_streaming  # noqa: E402
+import test_video  # noqa: E402
+import test_music_video  # noqa: E402
+import test_dm_detection  # noqa: E402
+import test_features  # noqa: E402
 import test_utils_cmds  # noqa: E402
 import test_verses  # noqa: E402
 import test_warnings  # noqa: E402
@@ -41,10 +47,21 @@ import test_moon  # noqa: E402
 import test_notify  # noqa: E402
 import test_player  # noqa: E402
 import test_presence  # noqa: E402
+import test_reaction_roles  # noqa: E402
+import test_crypto  # noqa: E402
+import test_link_previews  # noqa: E402
 import test_musings  # noqa: E402
+import test_reactions  # noqa: E402
 import test_ranking  # noqa: E402
 import test_scheduled  # noqa: E402
 import test_settings  # noqa: E402
+import test_iptv  # noqa: E402
+import test_tv_cmds  # noqa: E402
+import test_tv  # noqa: E402
+import test_tv_flow  # noqa: E402
+import test_banner  # noqa: E402
+import test_video_library  # noqa: E402
+import test_relay  # noqa: E402
 from _harness import run  # noqa: E402
 
 if __name__ == "__main__":
@@ -67,9 +84,19 @@ if __name__ == "__main__":
                    + test_spotify.SUITES
                    + test_status.SUITES
                    + test_voice_audio.SUITES
+                   + test_voicechat.SUITES
+                   + test_voice_streaming.SUITES
+                   + test_video.SUITES
+                   + test_music_video.SUITES
+                   + test_dm_detection.SUITES
+                   + test_features.SUITES
                    + test_welcome.SUITES
                    + test_presence.SUITES
+                   + test_reaction_roles.SUITES
+                   + test_crypto.SUITES
+                   + test_link_previews.SUITES
                    + test_musings.SUITES
+                   + test_reactions.SUITES
                    + test_audit.SUITES
                    + test_warnings.SUITES
                    + test_notify.SUITES
@@ -80,4 +107,11 @@ if __name__ == "__main__":
                    + test_bans.SUITES
                    + test_honeypot.SUITES
                    + test_moon.SUITES
-                   + test_utils_cmds.SUITES))
+                   + test_utils_cmds.SUITES
+                   + test_iptv.SUITES
+                   + test_tv_cmds.SUITES
+                   + test_tv.SUITES
+                   + test_tv_flow.SUITES
+                   + test_banner.SUITES
+                   + test_video_library.SUITES
+                   + test_relay.SUITES))

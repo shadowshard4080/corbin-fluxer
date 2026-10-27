@@ -26,6 +26,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from . import crypto
+
 logger = logging.getLogger("corbin.warnings")
 
 WARN_FILE = "spamblock_warnings.json"
@@ -111,23 +113,19 @@ class WarningStore:
 
     def _read(self) -> dict:
         try:
-            with open(self.path, "r", encoding="utf-8-sig") as handle:
-                data = json.load(handle)
+            data = crypto.read_json(self.path)
             return data if isinstance(data, dict) else {}
         except FileNotFoundError:
             return {}
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             logger.warning("unreadable warnings file %s; starting empty",
                            self.path)
             return {}
 
     def _write(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
         try:
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump(self._data, handle, indent=2, default=str)
-            os.replace(tmp, self.path)
+            crypto.write_json(self.path, self._data, indent=2, default=str)
         except OSError:
             logger.exception("could not persist warnings")
 

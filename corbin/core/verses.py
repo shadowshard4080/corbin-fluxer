@@ -1,8 +1,14 @@
 """Bible verse lookup.
 
-Parsing lives in ``verse_refs``; this module is the I/O: fetching from
-bolls.life and reading the optional John Gill SQLite. Fluxer has no
-buttons, so the translation is a command parameter.
+The parsing layer is **reused** from ``cogs/versefinder_cog.py`` rather than
+reimplemented: the 66-book alias table, the reference regex and the text
+cleaners encode real work, including the rule that two-letter abbreviations
+which are also English words (``is``, ``am``, ``re``) must never match, or
+"is 3:30 ok?" becomes a verse lookup.
+
+Only the I/O is new: fetching from bolls.life and reading the bundled John
+Gill SQLite. On Discord the translations sat behind buttons; Fluxer has no
+components, so the translation is a command parameter instead.
 """
 
 from __future__ import annotations
@@ -21,8 +27,14 @@ MAX_VERSES = 12
 _vf: Any = None
 
 
-def load(*_args: Any) -> Any:
-    """Load the parser. Kept as a call so a broken import is caught at boot."""
+def load(*_ignored: Any) -> Any:
+    """The reference parser, ``verse_refs``.
+
+    It used to be imported from the Discord bot's ``cogs/versefinder_cog``
+    behind a discord stub. ``verse_refs`` is that parsing layer on its own
+    (checked identical, definition by definition, when the bots were
+    separated). Ignores the old repo-root argument.
+    """
     global _vf
     if _vf is None:
         from . import verse_refs as module
@@ -36,7 +48,9 @@ def translations() -> dict[str, str]:
     vf = _vf
     return {vf.KJV: "King James Version (1769)",
             vf.NASB: "New American Standard Bible (1995)",
-            vf.NET: "New English Translation"}
+            vf.NET: "New English Translation",
+            vf.WLC: "Westminster Leningrad Codex (Hebrew)",
+            vf.TR: "Textus Receptus (Greek)"}
 
 
 def parse(text: str) -> list[dict]:

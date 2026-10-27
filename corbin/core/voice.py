@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -51,6 +52,22 @@ CONNECT_TIMEOUT = 40.0
 #: command's typing indicator running forever. Each step is bounded and
 #: the gateway leave is sent even when the step before it hung.
 TEARDOWN_STEP_TIMEOUT = 8.0
+#: Ceilings on the audio track's publish and unpublish between songs.
+#: fluxer.py unpublishes with no timeout when a track stops, and ⏮️ with a
+#: music video also published wedged right there: the restart never
+#: returned, held the player's lock, and every button went dead (live,
+#: 2026-10-17). Publishing is bounded for the same reason.
+AUDIO_TRACK_TIMEOUT = 5.0
+#: Seconds of a song's audio decoded ahead of playback (music and radio;
+#: not TV or the video library, whose one ffmpeg also feeds the picture).
+#: Corbin used to read only as fast as he played, with LiveKit's 1 s
+#: queue as the whole cushion, so any pause in YouTube's delivery longer
+#: than that was a gap people heard. Live 2026-10-20, a 1080p music video:
+#: "longest audio wait 4.94s, loop lag 3ms": the source, not the bot.
+#: A song's audio is small (30 s is ~5.8 MB of PCM), so ffmpeg can run
+#: well ahead whenever YouTube is fast and coast through when it isn't.
+AUDIO_READ_AHEAD = 30.0
+AUDIO_PUBLISH_TIMEOUT = 10.0
 
 #: Opus bitrate we ask LiveKit to publish at, in bits per second.
 #:
@@ -80,6 +97,21 @@ class Session:
     watcher: Optional[asyncio.Task] = field(default=None, repr=False)
     #: Last announced track, so the same song is never posted twice.
     last_track: str = ""
+    #: Voice chat listener (``core.voicechat.Listener``), if one is
+    #: running. Owned by the session so leaving voice by any route --
+    #: "stop the radio", a channel move, shutdown -- stops listening too.
+    listener: Optional[Any] = field(default=None, repr=False)
+    #: Async callables run when the session is left, by any route: the
+    #: video stream registers its stop here (``core.video``).
+    closers: list = field(default_factory=list, repr=False)
+    #: Monotonic time from which this session's voice time is uncounted.
+    counted_from: float = field(default_factory=time.monotonic, repr=False)
+
+    def take_elapsed(self) -> float:
+        """Seconds since last counted, and restart the count from now."""
+        now = time.monotonic()
+        elapsed, self.counted_from = now - self.counted_from, now
+        return max(0.0, elapsed)
 
     @property
     def playing(self) -> bool:
@@ -93,6 +125,69 @@ class Session:
             self.watcher.cancel()
         self.watcher = None
 
+    async def close_listener(self) -> None:
+        listener, self.listener = self.listener, None
+        if listener is not None:
+            try:
+                await listener.close()
+            except Exception:
+                logger.debug("voice chat listener close failed",
+                             exc_info=True)
+
+
+def _note_dry(clock: dict, source: Any) -> None:
+    """Count the times LiveKit's playout queue had run empty when the
+    next frame arrived: an audible gap. Counted as transitions, after
+    the first second (the queue starts empty), so one long gap is one.
+    Read by ``times_dry`` for the stream stats line."""
+    try:
+        queued = float(source.queued_duration)
+    except Exception:
+        return
+    dry = queued <= 0.005 and clock["captured"] > clock["rate"]
+    if dry and not clock.get("was_dry"):
+        clock["dry"] = clock.get("dry", 0) + 1
+    clock["was_dry"] = dry
+
+
+def times_dry(client: Any) -> Optional[int]:
+    """How often this track's sound has run dry, or None (no track)."""
+    clock = getattr(client, "_corbin_audio_clock", None)
+    return clock.get("dry", 0) if clock else None
+
+
+def sound_stats(client: Any) -> str:
+    """", sound ran dry Nx, longest audio wait 1.4s" for a stream's stats
+    line, the wait since the last call (then reset); "" with no track."""
+    clock = getattr(client, "_corbin_audio_clock", None)
+    if not clock:
+        return ""
+    wait = clock.get("wait_max", 0.0)
+    clock["wait_max"] = 0.0
+    text = (f", sound ran dry {clock.get('dry', 0)}x, longest audio wait "
+            f"{wait:.2f}s")
+    if "buffered" in clock:
+        text += f", audio buffer {clock['buffered']:.1f}s"
+    return text
+
+
+def audio_position(client: Any) -> Optional[float]:
+    """Seconds of the current track that listeners have heard, or None.
+
+    Samples handed to LiveKit, less what is still in its queue (the frame
+    loop runs up to ~1 s ahead of playout). Freezes while paused, since
+    the loop stops capturing. The clock a music video syncs to.
+    """
+    clock = getattr(client, "_corbin_audio_clock", None)
+    if not clock:
+        return None
+    source = clock.get("source")
+    try:
+        queued = float(source.queued_duration) if source is not None else 0.0
+    except Exception:
+        queued = 0.0
+    return max(0.0, clock["captured"] / clock["rate"] - queued)
+
 
 class VoiceManager:
     """Tracks one voice session per guild."""
@@ -102,6 +197,26 @@ class VoiceManager:
         self._sessions: dict[str, Session] = {}
         #: Guild -> teardown steps that failed on the last disconnect.
         self._teardown_failures: dict[str, tuple[str, ...]] = {}
+        #: Called with seconds spent in voice when a session ends, for the
+        #: daily digest.
+        self.on_voice_time: Optional[Any] = None
+
+    def collect_voice_time(self) -> float:
+        """Uncounted seconds across live sessions, marking them counted.
+
+        The digest calls this before posting, so a session running across
+        8 PM is split between the two days rather than landing whole in
+        whichever day it ends.
+        """
+        return sum(s.take_elapsed() for s in self._sessions.values())
+
+    def _credit(self, session: "Session") -> None:
+        if self.on_voice_time is None:
+            return
+        try:
+            self.on_voice_time(session.take_elapsed())
+        except Exception:
+            logger.debug("voice time counter failed", exc_info=True)
 
     def get(self, guild_id: Optional[str]) -> Optional[Session]:
         return self._sessions.get(str(guild_id)) if guild_id else None
@@ -166,36 +281,127 @@ class VoiceManager:
             if proc.stdout is None:
                 raise RuntimeError("ffmpeg did not open stdout")
 
-            rtc_source = rtc.AudioSource(source.sample_rate,
-                                         source.num_channels)
+            # Live TV asks for a shorter queue (core.tv.TV_AUDIO_QUEUE_MS)
+            # so its picture's read-ahead stays small; music keeps 1 s.
+            queue_ms = getattr(source, "corbin_queue_ms", None)
+            rtc_source = rtc.AudioSource(
+                source.sample_rate, source.num_channels,
+                **({"queue_size_ms": int(queue_ms)} if queue_ms else {}))
             await client._publish_track(rtc_source)
+            # The audio clock a music video syncs to (audio_position):
+            # samples handed to LiveKit, less what is still queued there.
+            clock = {"source": rtc_source, "rate": source.sample_rate,
+                     "captured": 0, "dry": 0, "was_dry": False}
+            client._corbin_audio_clock = clock
+            # Read ahead into a queue (AUDIO_READ_AHEAD), unless the
+            # source asks for a short LiveKit queue: those (TV, the video
+            # library) share their ffmpeg with the picture and must stay
+            # in step with it.
+            ahead = None if queue_ms else asyncio.Queue(
+                maxsize=max(1, int(AUDIO_READ_AHEAD * 50)))
+            END = object()
+
+            async def _read_ahead() -> None:
+                try:
+                    while True:
+                        try:
+                            chunk = await proc.stdout.readexactly(
+                                chunk_bytes)
+                        except asyncio.IncompleteReadError as exc:
+                            if exc.partial:
+                                await ahead.put(exc.partial + b"\x00" * (
+                                    chunk_bytes - len(exc.partial)))
+                            break
+                        await ahead.put(chunk)
+                except (ConnectionError, asyncio.CancelledError):
+                    pass
+                finally:
+                    try:
+                        ahead.put_nowait(END)
+                    except asyncio.QueueFull:
+                        # Make room: the end must get through.
+                        try:
+                            ahead.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass
+                        ahead.put_nowait(END)
+
+            reader = asyncio.ensure_future(_read_ahead()) \
+                if ahead is not None else None
             try:
                 while True:
                     await client._resume_event.wait()
                     last = False
-                    try:
-                        data = await proc.stdout.readexactly(chunk_bytes)
-                    except asyncio.IncompleteReadError as exc:
-                        # The only legitimate short read: end of stream.
-                        data = exc.partial
-                        if not data:
+                    asked = time.monotonic()
+                    if ahead is not None:
+                        clock["buffered"] = ahead.qsize() * 0.02
+                        data = await ahead.get()
+                        if data is END:
                             break
-                        data += b"\x00" * (chunk_bytes - len(data))
-                        last = True
+                    else:
+                        try:
+                            data = await proc.stdout.readexactly(chunk_bytes)
+                        except asyncio.IncompleteReadError as exc:
+                            # The only legitimate short read: end of
+                            # stream.
+                            data = exc.partial
+                            if not data:
+                                break
+                            data += b"\x00" * (chunk_bytes - len(data))
+                            last = True
 
+                    # How long ffmpeg kept us waiting for this chunk: with
+                    # a low loop lag, a long wait means the sound's own
+                    # source (the network, YouTube) was the holdup.
+                    waited = time.monotonic() - asked
+                    if waited > clock.get("wait_max", 0.0):
+                        clock["wait_max"] = waited
+                    samples = len(data) // (2 * source.num_channels)
+                    _note_dry(clock, rtc_source)
                     await rtc_source.capture_frame(rtc.AudioFrame(
                         data=data, sample_rate=source.sample_rate,
                         num_channels=source.num_channels,
-                        samples_per_channel=(
-                            len(data) // (2 * source.num_channels))))
+                        samples_per_channel=samples))
+                    clock["captured"] += samples
                     # No sleep: capture_frame blocks on a full queue and
                     # is the pacing mechanism. See the docstring.
                     if last:
                         break
             finally:
+                if reader is not None and not reader.done():
+                    reader.cancel()
+                if getattr(client, "_corbin_audio_clock", None) is clock:
+                    client._corbin_audio_clock = None
                 if proc.returncode is None:
                     proc.kill()
-                await proc.wait()
+                # communicate(), not wait(): asyncio's wait() only returns
+                # once stdout is closed, and unread audio left in the pipe
+                # kept it open. Stopping one track took 44 s (live ⏮️,
+                # 2026-10-17); it's also why stopping the radio once
+                # took ~8 s. Draining lets the pipe reach EOF at once.
+                try:
+                    await asyncio.wait_for(proc.communicate(),
+                                           AUDIO_TRACK_TIMEOUT)
+                except asyncio.TimeoutError:
+                    logger.warning("audio ffmpeg didn't exit within %.0fs",
+                                   AUDIO_TRACK_TIMEOUT)
+                # Unpublish here, bounded, and clear the publication so the
+                # SDK's own (unbounded) unpublish after us is skipped. See
+                # AUDIO_TRACK_TIMEOUT.
+                publication = getattr(client, "_current_publication", None)
+                if publication is not None and client._room is not None:
+                    try:
+                        await asyncio.wait_for(
+                            client._room.local_participant.unpublish_track(
+                                publication.sid), AUDIO_TRACK_TIMEOUT)
+                    except asyncio.TimeoutError:
+                        logger.warning("audio track unpublish hung for "
+                                       "%.0fs; carrying on without it",
+                                       AUDIO_TRACK_TIMEOUT)
+                    except Exception:
+                        logger.debug("audio unpublish failed", exc_info=True)
+                    client._current_publication = None
+                    client._current_track = None
 
         try:
             client._run_ffmpeg_loop = _loop
@@ -252,10 +458,16 @@ class VoiceManager:
             # re-exported on ``livekit.rtc``, so naming the type fails.
             options.audio_encoding.max_bitrate = MUSIC_BITRATE
             try:
-                client._current_publication = \
-                    await client._room.local_participant.publish_track(
-                        track, options)
+                client._current_publication = await asyncio.wait_for(
+                    client._room.local_participant.publish_track(
+                        track, options), AUDIO_PUBLISH_TIMEOUT)
                 client._current_track = track
+            except asyncio.TimeoutError:
+                # Not the profile's fault: the server didn't answer. The
+                # SDK's own publish would hang the same way, so fail the
+                # track (the player retries) rather than fall back.
+                raise RuntimeError("the voice server didn't take the audio "
+                                   f"track within {AUDIO_PUBLISH_TIMEOUT:.0f}s")
             except Exception:
                 # Better thin audio than none. A tweak to sound quality
                 # must never be able to stop playback -- publishing with
@@ -355,13 +567,29 @@ class VoiceManager:
         session = self._sessions.pop(str(guild_id), None)
         if session is None:
             return False
+        self._credit(session)
         session.cancel_watcher()
+        await session.close_listener()
+        for closer in list(session.closers):
+            try:
+                await asyncio.wait_for(closer(), TEARDOWN_STEP_TIMEOUT * 3)
+            except Exception:
+                logger.warning("voice teardown: a session closer failed in "
+                               "guild %s", guild_id, exc_info=True)
+        session.closers.clear()
         client = session.client
         failed: list[str] = []
 
         async def step(name: str, make: Any) -> None:
+            started = time.monotonic()
             try:
                 await asyncio.wait_for(make(), timeout=TEARDOWN_STEP_TIMEOUT)
+                took = time.monotonic() - started
+                # Stopping the radio took ~8 s with no step timing out
+                # (first live test). Name the slow step when it happens.
+                if took >= 1.0:
+                    logger.info("voice teardown: %s took %.1fs in guild %s",
+                                name, took, guild_id)
             except asyncio.TimeoutError:
                 logger.warning("voice teardown: %s timed out after %.0fs "
                                "in guild %s", name, TEARDOWN_STEP_TIMEOUT,
@@ -382,12 +610,15 @@ class VoiceManager:
                            "changed shape, falling back to its disconnect()")
             await step("disconnect", client.disconnect)
         else:
-            await step("leave voice channel",
-                       lambda: gateway.update_voice_state(
-                           guild_id=str(guild_id), channel_id=None))
+            # Independent of each other, so run together: the slower of
+            # the two, not their sum.
             room = client._room
+            steps = [step("leave voice channel",
+                          lambda: gateway.update_voice_state(
+                              guild_id=str(guild_id), channel_id=None))]
             if room is not None:
-                await step("close LiveKit room", room.disconnect)
+                steps.append(step("close LiveKit room", room.disconnect))
+            await asyncio.gather(*steps)
             client._room = None
             connected = getattr(client, "_connected", None)
             if connected is not None:
@@ -424,3 +655,81 @@ class VoiceManager:
                 if got is not None:
                     return got
         return None
+
+
+#: How long he stays in a voice channel with nobody else in it (s).
+#: Owner's choice: about 20 seconds.
+EMPTY_LEAVE_AFTER = 20.0
+
+
+class EmptyChannelWatch:
+    """Leave a voice channel once nobody else has been in it for a while.
+
+    He used to stay forever: radio playing to an empty room, voice chat
+    listening to nobody, and with voice chat the local model set aside the
+    whole time. ``check`` runs on every voice state change and on the
+    scheduler tick; a countdown starts when his channel empties, is
+    cancelled when someone comes back, and re-checks before leaving.
+
+    ``occupants(channel_id)`` counts the people there other than him.
+    ``leave(guild_id)`` does the leaving (the music stop, which also clears
+    the queue, or a plain disconnect).
+    """
+
+    def __init__(self, voice: Any, *, occupants: Any, leave: Any,
+                 delay: float = EMPTY_LEAVE_AFTER) -> None:
+        self.voice = voice
+        self.occupants = occupants
+        self.leave = leave
+        self.delay = delay
+        #: guild -> (channel the countdown is for, its task).
+        self._timers: dict[str, tuple[str, asyncio.Task]] = {}
+
+    def _cancel(self, guild_id: str) -> None:
+        entry = self._timers.pop(guild_id, None)
+        if entry is not None and not entry[1].done():
+            entry[1].cancel()
+
+    def check(self, guild_id: Optional[str]) -> None:
+        if not guild_id:
+            return
+        gid = str(guild_id)
+        session = self.voice.get(gid)
+        if session is None or self.occupants(session.channel_id) > 0:
+            self._cancel(gid)
+            return
+        running = self._timers.get(gid)
+        if running is not None and not running[1].done():
+            if running[0] == session.channel_id:
+                return
+            # Moved to another empty channel: start over for that one.
+            self._cancel(gid)
+        self._timers[gid] = (session.channel_id, asyncio.create_task(
+            self._later(gid, session.channel_id)))
+
+    def sweep(self) -> None:
+        """Check every session (backs up a missed voice state event)."""
+        for gid in list(getattr(self.voice, "_sessions", {})):
+            self.check(gid)
+
+    async def _later(self, guild_id: str, channel_id: str) -> None:
+        try:
+            await asyncio.sleep(self.delay)
+        except asyncio.CancelledError:
+            return
+        session = self.voice.get(guild_id)
+        if session is None or session.channel_id != channel_id \
+                or self.occupants(channel_id) > 0:
+            return
+        logger.info("voice: nobody else in %s for %.0fs; leaving",
+                    session.channel_name or channel_id, self.delay)
+        try:
+            await self.leave(guild_id)
+        except Exception:
+            logger.warning("voice: leaving the empty channel failed in "
+                           "guild %s", guild_id, exc_info=True)
+        finally:
+            entry = self._timers.get(guild_id)
+            if entry is not None and entry[1] is asyncio.current_task():
+                self._timers.pop(guild_id, None)
+

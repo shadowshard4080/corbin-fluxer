@@ -83,8 +83,8 @@ def suite_gates(r: Results) -> None:
     mod = h.lookup("ban", Who(perms=Perm.BAN_MEMBERS), in_guild=True)
     r.ok("...and unmarked for someone who holds the permission",
          "can't run" not in mod)
-    r.ok("the bot owner bypasses guild permissions, like assess()",
-         "can't run" not in h.lookup("ban", Who("999"), in_guild=True))
+    r.ok("the bot owner gets no pass on guild permissions, like assess()",
+         "needs Ban Members" in h.lookup("ban", Who("999"), in_guild=True))
     r.ok("a per-person grant counts, like assess()",
          "can't run" not in h.lookup("ban", Who("7"), in_guild=True))
 
@@ -194,9 +194,69 @@ def suite_plumbing(r: Results) -> None:
     user_turn = llm.seen["messages"][-1]["content"]
     r.ok("the reference reaches the model", "[Tool:CommandReference]"
          in user_turn and "- remind" in user_turn)
+    r.ok("...and does not forbid the local fallback",
+         llm.seen.get("local_fallback", True) is True)
     stored = [t["content"] for t in convo.user_history("u")]
     r.ok("...and is not stored in history",
          not any("CommandReference" in str(t) for t in stored))
+
+
+def suite_set_aside(r: Results) -> None:
+    """A command mentioned but not requested ("you should join vc") is
+    named to the model, so it can't claim not to have it."""
+    from test_tool_calls import ToolLLM, reply
+    from corbin.ai.classifier import SYSTEM_PROMPT
+
+    reg = tiny_registry()
+    reg.register(spec("voice-chat", "Talk out loud in a voice channel",
+                      feature="voice", examples=("join voice chat",)))
+    h = CommandHelp(reg, features=lambda gid: {"voice"} if gid == "on"
+                    else frozenset())
+    vc = reg.get("voice-chat")
+    on = h.set_aside(vc, Who(), in_guild=True, guild_id="on")
+    r.ok("named with what it does", "voice-chat: Talk out loud" in on)
+    r.ok("...and how people ask", "join voice chat" in on)
+    off = h.set_aside(vc, Who(), in_guild=True, guild_id="off")
+    r.ok("off in this server says so", "not available in this server" in off)
+    r.ok("a staff command is marked for a member",
+         "can't run" in h.set_aside(reg.get("ban"), Who(), in_guild=True))
+
+    llm = ToolLLM(text="Ask me straight and I'm in.")
+    out, convo = reply(llm, set_aside=on)
+    user_turn = llm.seen["messages"][-1]["content"]
+    r.ok("the note reaches the model",
+         "[Tool:CommandNotRun]" in user_turn and "voice-chat" in user_turn)
+    r.ok("...and forbids denying it", "text-only" in user_turn)
+    r.ok("...and is not stored in history",
+         not any("CommandNotRun" in str(t["content"])
+                 for t in convo.user_history("u")))
+
+    # The phrasings that read as banter and shouldn't have.
+    for said in ("you should join the gaming vc", "can you join vc?",
+                 "could you play some lofi?"):
+        r.ok(f"the classifier is told {said!r} is a request",
+             said.lower() in SYSTEM_PROMPT.lower())
+    r.ok("...while a general ability question still isn't",
+         '"can you even ban people?"' in SYSTEM_PROMPT)
+
+
+def suite_draft_reply(r: Results) -> None:
+    """Voice writes a reply before the command check is in; a draft that
+    isn't used must leave nothing behind."""
+    from test_tool_calls import ToolLLM, reply
+
+    llm = ToolLLM(text="Doing well, you?")
+    out, convo = reply(llm, store=False)
+    r.check("the draft has the text", out, "Doing well, you?")
+    r.check("...and stores nothing", convo.user_history("u"), [])
+    convo.commit(user_id="u", speaker="Kit", guild_id=None,
+                 user_content="who won the finals?", text=out)
+    r.check("commit stores the exchange",
+            [t["role"] for t in convo.user_history("u")],
+            ["user", "assistant"])
+    out, convo = reply(ToolLLM(text="Hi."))
+    r.check("the default still stores it",
+            len(convo.user_history("u")), 2)
 
 
 SUITES = [
@@ -205,6 +265,8 @@ SUITES = [
     ("command question gate", suite_question_gate),
     ("command catalogue coverage", suite_real_registry),
     ("command lookup plumbing", suite_plumbing),
+    ("commands mentioned, not requested", suite_set_aside),
+    ("voice reply drafts", suite_draft_reply),
 ]
 
 if __name__ == "__main__":

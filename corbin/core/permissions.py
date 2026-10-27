@@ -145,3 +145,14 @@ def verify_against(vendor_flags: Mapping[str, int]) -> Sequence[str]:
                 f"{name}: ours={int(ours)} vendor={int(vendor_value)}"
             )
     return problems
+
+
+#: Permissions every ordinary member has. A command needing only these
+#: (joining voice for music, say) is for everyone, not a staff tool.
+MEMBER_PERMS = (Perm.VIEW_CHANNEL | Perm.SEND_MESSAGES | Perm.CONNECT
+                | Perm.SPEAK | Perm.READ_MESSAGE_HISTORY)
+
+
+def is_staff_permission(required: Perm) -> bool:
+    """Does ``required`` ask for anything beyond an ordinary member's?"""
+    return bool(int(required) & ~int(MEMBER_PERMS))

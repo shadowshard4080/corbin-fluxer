@@ -6,8 +6,11 @@ at 9pm", "2026-12-25 08:00", "in 3 days". Anything unparseable is
 is worse than one that was never set, because the user believes it is
 handled.
 
-Fire times are stored in UTC. A per-user timezone (learned by the memory
-extractor as an IANA id) is applied when parsing so "9pm" means their 9pm.
+Fire times are stored in UTC. A clock time ("9pm", "tomorrow") needs a
+zone: one written in the expression ("9pm PST") wins, then the zone the
+memory extractor learned. With neither, the command asks rather than
+assuming UTC -- that is what made "9pm" fire at 2 pm Pacific. Relative
+times ("in 20 minutes") need no zone.
 """
 
 from __future__ import annotations
@@ -18,9 +21,11 @@ import os
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Optional
+
+from . import crypto
 
 logger = logging.getLogger("corbin.reminders")
 
@@ -41,6 +46,36 @@ _CLOCK = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b", re.IGNORECASE)
 _UNITS = {"second": "seconds", "sec": "seconds", "minute": "minutes",
           "min": "minutes", "hour": "hours", "hr": "hours",
           "day": "days", "week": "weeks"}
+
+
+_ZONE_TOKEN = re.compile(
+    r"(?<![\w/])([A-Za-z]+/[A-Za-z_]+(?:/[A-Za-z_]+)?|[A-Za-z]{2,7})(?![\w/])")
+
+
+def is_relative(text: Optional[str]) -> bool:
+    """True for "in 20 minutes"-style input, which no timezone affects."""
+    return bool(_RELATIVE.search(text or ""))
+
+
+def split_zone(text: Optional[str]) -> tuple[Optional[tzinfo], str]:
+    """Pull a written timezone out of a time expression.
+
+    "tomorrow at 9pm PST" -> (America/Los_Angeles, "tomorrow at 9pm").
+    Only known abbreviations (the weather-alert alias table) and IANA
+    names count, so ordinary words are never read as zones.
+    """
+    from .weather_alerts import _TZ_ALIASES, resolve_tz
+
+    raw = text or ""
+    for match in _ZONE_TOKEN.finditer(raw):
+        token = match.group(1)
+        if "/" not in token and token.lower() not in _TZ_ALIASES:
+            continue
+        zone = resolve_tz(token)
+        if zone is not None:
+            rest = (raw[:match.start()] + raw[match.end():]).strip()
+            return zone, re.sub(r"\s{2,}", " ", rest)
+    return None, raw
 
 
 def user_timezone(name: Optional[str]) -> timezone | Any:
@@ -156,8 +191,7 @@ class ReminderStore:
         self.path = Path(root) / REMINDERS_FILE
         self._items: list[Reminder] = []
         try:
-            with open(self.path, "r", encoding="utf-8-sig") as handle:
-                data = json.load(handle)
+            data = crypto.read_json(self.path)
             for entry in data if isinstance(data, list) else []:
                 item = Reminder.from_dict(entry) if isinstance(entry, dict) \
                     else None
@@ -165,17 +199,14 @@ class ReminderStore:
                     self._items.append(item)
         except FileNotFoundError:
             pass
-        except (json.JSONDecodeError, OSError):
+        except (ValueError, OSError):
             logger.warning("unreadable reminders file; starting empty")
 
     def _flush(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.path.with_suffix(".tmp")
         try:
-            with open(tmp, "w", encoding="utf-8") as handle:
-                json.dump([r.to_dict() for r in self._items], handle,
-                          indent=2)
-            os.replace(tmp, self.path)
+            crypto.write_json(self.path, [r.to_dict() for r in self._items],
+                              indent=2)
         except OSError:
             logger.exception("could not persist reminders")
 

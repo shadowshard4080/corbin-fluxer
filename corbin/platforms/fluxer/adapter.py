@@ -83,33 +83,48 @@ TYPING_TIMEOUT = 5.0
 
 
 class _Typing:
-    """Keeps a typing indicator alive for the duration of a block."""
+    """Keeps a typing indicator alive for the duration of a block.
+
+    Entering never waits on the network: the first trigger runs in the
+    refresh task, so the indicator can be started the moment a message
+    arrives without adding latency to the reply.
+
+    Blocks nest and overlap per channel. The message handler holds one
+    across the whole reply while ``_converse`` and the executor open their
+    own inside it; one shared refresh loop runs while any block is open,
+    so nesting neither doubles the requests nor ends the indicator early.
+    """
 
     def __init__(self, adapter: "FluxerAdapter", channel_id: str) -> None:
         self._adapter = adapter
         self._channel_id = str(channel_id)
-        self._task: Optional[_asyncio.Task] = None
 
     async def __aenter__(self) -> "_Typing":
-        ok = await self._adapter.trigger_typing(self._channel_id)
-        if ok:
-            self._task = _asyncio.create_task(self._loop())
+        adapter, key = self._adapter, self._channel_id
+        adapter._typing_refs[key] = adapter._typing_refs.get(key, 0) + 1
+        if key not in adapter._typing_tasks:
+            adapter._typing_tasks[key] = _asyncio.create_task(self._loop())
         return self
 
     async def _loop(self) -> None:
         try:
-            while True:
+            while await self._adapter.trigger_typing(self._channel_id):
                 await _asyncio.sleep(TYPING_REFRESH)
-                if not await self._adapter.trigger_typing(self._channel_id):
-                    return
         except _asyncio.CancelledError:
             pass
 
     async def __aexit__(self, *_exc: object) -> None:
-        if self._task is not None:
-            self._task.cancel()
+        adapter, key = self._adapter, self._channel_id
+        left = adapter._typing_refs.get(key, 1) - 1
+        if left > 0:
+            adapter._typing_refs[key] = left
+            return
+        adapter._typing_refs.pop(key, None)
+        task = adapter._typing_tasks.pop(key, None)
+        if task is not None:
+            task.cancel()
             try:
-                await self._task
+                await task
             except (_asyncio.CancelledError, Exception):
                 pass
 
@@ -210,6 +225,8 @@ def to_member(raw: Any, *, guild_id: str,
         roles=roles,
         joined_at=_as_dt(_attr(raw, "joined_at", "joinedAt")),
         is_guild_owner=bool(guild_owner_id and user.id == str(guild_owner_id)),
+        nick=(str(_attr(raw, "nick", default="") or "") or None)
+        if user_obj is not raw else None,
     )
 
 
@@ -359,12 +376,21 @@ class FluxerAdapter:
         self._dm_blocked: set[str] = set()
         #: Channel -> monotonic time until which typing is disabled.
         self._typing_disabled_until: dict[str, float] = {}
+        #: Open typing blocks per channel, and the one refresh loop each.
+        self._typing_refs: dict[str, int] = {}
+        self._typing_tasks: dict[str, _asyncio.Task] = {}
         #: guild id -> (expiry, {role_id: Role}); roles change rarely, and
         #: refetching them on every message would double our API traffic.
         self._role_cache: dict[str, tuple[float, dict[str, Role]]] = {}
+        #: channel id -> is it a DM. A channel's type never changes, so
+        #: both answers are kept for good.
+        self._dm_cache: dict[str, bool] = {}
         self._member_index_cache: dict[str, tuple[float, dict[str, str]]] = {}
         #: guild id -> (expiry, {name: channel id})
         self._channel_index_cache: dict[str, tuple[float, dict]] = {}
+        #: ``core.reactions.ReactionPanels``, set by bot.py. When present,
+        #: an embed carrying ``controls`` gets its reactions after sending.
+        self.panels: Any = None
 
     def capabilities(self) -> Capabilities:
         return self._caps
@@ -404,8 +430,8 @@ class FluxerAdapter:
         """Async context manager that keeps the indicator alive.
 
         The indicator expires server-side after ~10s, so it is refreshed on a
-        timer for as long as the block runs -- scoped tightly around the model
-        call, never around the whole handler.
+        timer for as long as the block runs. Started as soon as a message
+        is known to be for Corbin and closed before the reply is posted.
         """
         return _Typing(self, channel_id)
 
@@ -447,11 +473,28 @@ class FluxerAdapter:
             return None
 
         kwargs = self._payload(response)
+        if response.reply_to:
+            # Here, not in _payload: edits reuse that, and an edit can't
+            # carry a reference.
+            kwargs["message_reference"] = {
+                "message_id": str(response.reply_to),
+                "channel_id": str(channel_id)}
         message = await self._watched(channel.send(**kwargs),
                                       f"send to {channel_id}")
         if message is None:
             return None
         message_id = str(_attr(message, "id", default="")) or None
+
+        controls = getattr(response.embed, "controls", None) \
+            if response.embed is not None else None
+        if controls is not None and message_id and self.panels is not None:
+            import asyncio
+
+            # Detached: adding a few reactions takes a second or two, and
+            # the caller shouldn't wait on it.
+            asyncio.create_task(self.panels.attach(
+                message_id, channel_id, controls.state.get("guild_id"),
+                controls))
 
         # Emulate ephemerality when we had to post publicly.
         delete_after = response.delete_after
@@ -492,6 +535,24 @@ class FluxerAdapter:
             logger.error("%s gave up after %.0fs; nothing was posted", what,
                          SEND_TIMEOUT)
             return None
+
+    async def send_voice_state(self, body: dict) -> None:
+        """Send a raw op 4 (voice state update) on the main gateway.
+
+        fluxer.py's ``update_voice_state`` sends only guild, channel,
+        mute and deaf; streaming needs ``self_stream`` and the
+        ``connection_id`` (see ``corbin/core/video.py``), so the payload
+        is built here instead.
+        """
+        from fluxer.enums import GatewayOpcode
+        from fluxer.gateway import GatewayPayload
+
+        gateway = getattr(self.client, "_gateway", None)
+        if gateway is None:
+            raise RuntimeError("fluxer.py Client has no _gateway — the SDK "
+                               "moved; adapter needs updating")
+        await gateway._send(GatewayPayload(
+            op=GatewayOpcode.VOICE_STATE_UPDATE, d=dict(body)))
 
     def _rest(self) -> Any:
         """The SDK's REST client.
@@ -584,6 +645,64 @@ class FluxerAdapter:
                        "will post as plain text", self.emoji_id,
                        len(guild_ids), EMOJI_SHORTHAND)
         return False
+
+    # -- reactions -------------------------------------------------------
+
+    async def add_reaction(self, channel_id: str, message_id: str,
+                           emoji: str) -> bool:
+        try:
+            await self._watched(self._rest().add_reaction(
+                str(channel_id), str(message_id), emoji), "add reaction")
+            return True
+        except Exception:
+            logger.debug("add_reaction %s on %s failed", emoji, message_id,
+                         exc_info=True)
+            return False
+
+    async def remove_user_reaction(self, channel_id: str, message_id: str,
+                                   emoji: str, user_id: str) -> bool:
+        """Take someone else's reaction off. Needs Manage Messages."""
+        try:
+            await self._watched(self._rest().delete_reaction(
+                str(channel_id), str(message_id), emoji, str(user_id)),
+                "remove reaction")
+            return True
+        except Exception:
+            logger.debug("remove reaction %s from %s failed", emoji,
+                         message_id, exc_info=True)
+            return False
+
+    async def fetch_message_raw(self, channel_id: str,
+                                message_id: str) -> Optional[dict]:
+        """The REST payload for one message, or None."""
+        try:
+            fetch = getattr(self._rest(), "get_message", None)
+            if fetch is None:
+                return None
+            data = await fetch(str(channel_id), str(message_id))
+        except Exception:
+            logger.debug("could not fetch message %s", message_id,
+                         exc_info=True)
+            return None
+        return data if isinstance(data, dict) else None
+
+    async def messages_before(self, channel_id: str, message_id: str,
+                              limit: int = 10) -> list[dict]:
+        """REST payloads of the messages just before one, newest first.
+
+        For recovering context the in-memory transcript lost to a restart.
+        """
+        try:
+            fetch = getattr(self._rest(), "get_messages", None)
+            if fetch is None:
+                return []
+            rows = await fetch(str(channel_id), limit=limit,
+                               before=str(message_id)) or []
+        except Exception:
+            logger.info("could not read messages before %s in %s",
+                        message_id, channel_id, exc_info=True)
+            return []
+        return [r for r in rows if isinstance(r, dict)]
 
     async def message_author(self, channel_id: str,
                              message_id: str) -> Optional[str]:
@@ -782,6 +901,41 @@ class FluxerAdapter:
             logger.warning("delete failed for %s/%s", channel_id, message_id,
                            exc_info=True)
 
+    async def delete_message_strict(self, channel_id: str,
+                                    message_id: str) -> None:
+        """Delete by REST and **raise** on failure: for callers that act
+        on whether it worked (the banner repost keeps a record of
+        originals it couldn't remove). ``delete_message`` swallows."""
+        await self._rest().delete_message(str(channel_id), str(message_id))
+
+    async def channel_history(self, channel_id: str,
+                              limit: int = 500) -> list[dict]:
+        """Up to ``limit`` REST message payloads, newest first, paged 100
+        at a time with ``before``. Raises if the first page fails (a
+        channel he can't read must not look like an empty one)."""
+        http = self._rest()
+        out: list[dict] = []
+        before = None
+        while len(out) < limit:
+            page = await http.get_messages(
+                str(channel_id), limit=min(100, limit - len(out)),
+                before=before) or []
+            rows = [r for r in page if isinstance(r, dict)]
+            out.extend(rows)
+            if len(rows) < 100:
+                break
+            before = rows[-1].get("id")
+        return out
+
+    async def set_guild_banner(self, guild_id: str, image: bytes) -> None:
+        """``PATCH /guilds/{id}`` with the banner as a data URI. fluxer.py
+        0.4.2's ``modify_guild`` only knows name and icon, but passes any
+        other field through. Raises with Fluxer's error on refusal."""
+        from ...core.banner import data_uri
+
+        await self._rest().modify_guild(str(guild_id),
+                                        banner=data_uri(image))
+
     async def purge(self, channel_id: str, count: int) -> int:
         """Delete up to ``count`` recent messages. Returns how many went.
 
@@ -917,6 +1071,28 @@ class FluxerAdapter:
         return await self._lookup(self.client, "get_user",
                                   "fetch_user", str(user_id))
 
+    async def user_avatar_url(self, user_id: str) -> Optional[str]:
+        """A user's avatar URL by id, or None.
+
+        For when the user is not the author of the message in hand --
+        a level-up flushed by someone else's message went out as
+        "Someone" with no face because only the author's avatar was known.
+        """
+        try:
+            raw = await self._user(str(user_id))
+        except Exception:
+            logger.debug("avatar lookup failed for %s", user_id,
+                         exc_info=True)
+            return None
+        if raw is None:
+            return None
+        url = getattr(raw, "avatar_url", None) \
+            or getattr(raw, "default_avatar_url", None)
+        if url:
+            return str(url)
+        from ...core.welcome import avatar_url
+        return avatar_url(str(user_id), getattr(raw, "avatar", None))
+
     async def member_count(self, guild_id: str) -> Optional[int]:
         """How many members the guild has right now, or None.
 
@@ -940,9 +1116,50 @@ class FluxerAdapter:
         count = _attr(guild, "member_count") if guild is not None else None
         return count if isinstance(count, int) else None
 
+    async def guild_list(self, *, counts: bool = True) -> list[dict]:
+        """Every server he's in: ``[{id, name, members}]``, by name.
+
+        REST first (``GET /users/@me/guilds``, authoritative), then the
+        gateway cache. Both failing **raises**: "I'm in no servers" would
+        be the plausible wrong answer. ``members`` is None when the count
+        couldn't be read, never a guessed 0.
+        """
+        rows: dict[str, dict] = {}
+        rest_error: Optional[BaseException] = None
+        try:
+            for raw in await self._rest().get_current_user_guilds() or ():
+                if isinstance(raw, dict) and raw.get("id"):
+                    rows[str(raw["id"])] = {"id": str(raw["id"]),
+                                            "name": str(raw.get("name")
+                                                        or "?")}
+        except Exception as exc:
+            rest_error = exc
+            logger.warning("guild list via REST failed; using the gateway "
+                           "cache", exc_info=True)
+        for guild in getattr(self.client, "guilds", None) or ():
+            gid = str(_attr(guild, "id") or "")
+            if gid and gid not in rows:
+                rows[gid] = {"id": gid, "name": str(_attr(guild, "name")
+                                                    or "?")}
+        if not rows and rest_error is not None:
+            raise RuntimeError(f"couldn't list my servers: {rest_error}")
+        out = sorted(rows.values(), key=lambda r: r["name"].lower())
+        if counts:
+            sem = _asyncio.Semaphore(5)
+
+            async def count(row: dict) -> None:
+                async with sem:
+                    row["members"] = await self.member_count(row["id"])
+            await _asyncio.gather(*(count(r) for r in out))
+        return out
+
     async def _guild(self, guild_id: str) -> Any:
         return await self._lookup(self.client, "get_guild",
                                   "fetch_guild", str(guild_id))
+
+    def forget_roles(self, guild_id: str) -> None:
+        """Drop the cached role index so the next read refetches it."""
+        self._role_cache.pop(str(guild_id), None)
 
     async def role_index(self, guild_id: str) -> dict[str, Role]:
         """``{role_id: Role}`` for a guild, cached briefly."""
@@ -1126,6 +1343,32 @@ class FluxerAdapter:
             return index.get(text.split("#", 1)[0].lower(), text)
         return text
 
+    async def channel_is_dm(self, channel_id: str) -> bool:
+        """Is this a DM channel, asking the API when the cache missed?
+
+        fluxer.py attaches a message's channel only when it is already
+        cached, and a DM's channel usually isn't after a restart. The
+        message then said ``is_dm=False`` with no guild, read as a guild
+        channel that didn't mention him, and every DM was dropped with
+        no log line (2026-10-17: "the bot ignores DMs").
+        """
+        key = str(channel_id)
+        if key in self._dm_cache:
+            return self._dm_cache[key]
+        try:
+            channel = await self._channel(key)
+        except Exception:
+            logger.debug("DM check failed for channel %s", key,
+                         exc_info=True)
+            return False
+        if channel is None:
+            return False  # unknown: not cached, so the next one retries
+        kind = _attr(channel, "type")
+        is_dm = bool(_attr(channel, "is_dm", default=False)) or \
+            str(getattr(kind, "value", kind)) in ("1", "3")
+        self._dm_cache[key] = is_dm
+        return is_dm
+
     async def resolve_guild_id(self, channel_id: str) -> Optional[str]:
         """Fetch the channel to learn its guild, when the cache missed."""
         try:
@@ -1176,6 +1419,30 @@ class FluxerAdapter:
 
         return Guild(id=str(guild_id), name=name,
                      owner_id=str(owner) if owner else None)
+
+    async def member_nick(self, guild_id: Optional[str],
+                          user_id: str) -> Optional[str]:
+        """A member's server nickname, from the gateway cache only.
+
+        Message events carry the bare account, not the member, so the
+        speaker's name came from the account rather than the one used in
+        the server. Cache-only on purpose: this runs for every
+        message, and a REST call each would be wasteful. None on a miss.
+        """
+        if not guild_id:
+            return None
+        try:
+            guild = await self._guild(guild_id)
+            getter = getattr(guild, "get_member", None)
+            if not callable(getter):
+                return None
+            for key in (str(user_id), int(user_id)):
+                hit = getter(key)
+                if hit is not None:
+                    return str(getattr(hit, "nick", "") or "") or None
+        except Exception:
+            logger.debug("member nick lookup failed", exc_info=True)
+        return None
 
     async def fetch_member(self, guild_id: str, user_id: str) -> Optional[Member]:
         guild = await self._guild(guild_id)
@@ -1517,4 +1784,24 @@ def probe(module: Any = None) -> dict[str, list[str]]:
         warn.append("fluxer.voice.VoiceClient not importable — no music "
                     "publish profile")
 
+    # REST bindings the banner rotation (and #banner-images) depend on.
+    # Warnings: a missing one breaks that feature, not the bot.
+    try:
+        from fluxer.http import HTTPClient  # type: ignore
+
+        for name in REST_FOR_FEATURES:
+            if hasattr(HTTPClient, name):
+                ok.append(f"HTTPClient.{name}")
+            else:
+                warn.append(f"HTTPClient.{name} is gone — banner rotation "
+                            f"won't work")
+    except Exception:
+        warn.append("fluxer.http.HTTPClient not importable")
+
     return {"ok": ok, "missing": miss, "warn": warn}
+
+
+#: Checked by ``probe`` as warnings (see there).
+REST_FOR_FEATURES = ("get_messages", "modify_guild", "delete_message",
+                     "create_guild_channel", "edit_channel_permissions",
+                     "get_guild_channels")

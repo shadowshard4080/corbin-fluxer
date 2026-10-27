@@ -10,7 +10,8 @@ Two different latencies, because they fail independently:
 fluxer.py tracks neither. ``_last_heartbeat_ack`` is a bare bool, and
 the ACK is handled inside a ``match`` in the receive loop with no seam
 to hook. So the heartbeat is timed from the **send** side only: the
-original is called through untouched and the ack flag is then polled.
+original is called through untouched and the ack flag is then polled
+from a separate task.
 Nothing in the connection path is replaced -- a failure here yields no
 number, never a dropped gateway.
 """
@@ -36,6 +37,8 @@ class GatewayPing:
     def __init__(self) -> None:
         self.latency: Optional[float] = None
         self._installed = False
+        self._measured = asyncio.Event()
+        self._pending: set[asyncio.Task] = set()
 
     def install(self, client: Any) -> bool:
         gateway = getattr(client, "_gateway", None)
@@ -46,17 +49,20 @@ class GatewayPing:
         async def timed() -> None:
             # The loop sets _last_heartbeat_ack False immediately before
             # calling this, so a True reading after the send is genuinely
-            # this beat's ACK and not a stale one.
+            # this beat's ACK. A beat the SERVER asked for arrives with the
+            # flag already True: timing it read ~0 ms, so it is not timed.
+            armed = not getattr(gateway, "_last_heartbeat_ack", True)
             started = time.monotonic()
             await original()
-            deadline = started + ACK_TIMEOUT
-            while time.monotonic() < deadline:
-                if getattr(gateway, "_last_heartbeat_ack", False):
-                    self.latency = time.monotonic() - started
-                    return
-                await asyncio.sleep(ACK_POLL)
-            # No ACK in time: report unknown rather than a wrong number.
-            self.latency = None
+            if not armed:
+                return
+            # Wait for the ACK off to the side. Polling inline held up the
+            # caller, and for a server-requested beat the caller is the
+            # receive loop -- the very thing that delivers the ACK.
+            task = asyncio.get_running_loop().create_task(
+                self._await_ack(gateway, started))
+            self._pending.add(task)
+            task.add_done_callback(self._pending.discard)
 
         try:
             gateway._send_heartbeat = timed
@@ -65,6 +71,30 @@ class GatewayPing:
             return False
         self._installed = True
         return True
+
+    async def _await_ack(self, gateway: Any, started: float) -> None:
+        deadline = started + ACK_TIMEOUT
+        while time.monotonic() < deadline:
+            if getattr(gateway, "_last_heartbeat_ack", False):
+                self.latency = time.monotonic() - started
+                self._measured.set()
+                return
+            await asyncio.sleep(ACK_POLL)
+        # No ACK in time: report unknown rather than a wrong number.
+        self.latency = None
+
+    async def wait(self, timeout: float) -> Optional[float]:
+        """The first reading, waiting up to ``timeout`` seconds for it.
+
+        The first heartbeat goes out at a random point in the interval
+        (~41s on Fluxer), so at boot there is almost never a number yet.
+        """
+        if self.latency is None:
+            try:
+                await asyncio.wait_for(self._measured.wait(), timeout)
+            except asyncio.TimeoutError:
+                pass
+        return self.latency
 
     @property
     def ms(self) -> Optional[float]:
@@ -100,6 +130,11 @@ def human_duration(seconds: float) -> str:
         return f"{seconds:.1f}s"
     minutes, secs = divmod(int(seconds), 60)
     return f"{minutes}m {secs}s"
+
+
+#: How long the boot notice waits for the first heartbeat before giving
+#: up and saying "unknown". Fluxer's interval is ~41s.
+FIRST_BEAT_WAIT = 90.0
 
 
 def human_latency(seconds: Optional[float]) -> str:

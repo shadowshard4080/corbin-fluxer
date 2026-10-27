@@ -11,6 +11,10 @@ from ..core.registry import Param, Risk, command
 
 COLOUR = 0x2C3E50
 
+#: The router may only run these when the moon is actually mentioned:
+#: "will that be a full pot?" became the moon calendar.
+MOON_TOPIC = r"\b(?:moon|moons|lunar|lunation)\b"
+
 
 def _resolve_channel(ctx: CommandContext, value: Optional[str]) -> Optional[str]:
     if not value:
@@ -27,6 +31,7 @@ def _resolve_channel(ctx: CommandContext, value: Optional[str]) -> Optional[str]
     risk=Risk.SAFE,
     guild_only=False,
     aliases=("moonphase", "moon_phase"),
+    topic=MOON_TOPIC,
     examples=("what phase is the moon", "show me the moon",
               "when's the next full moon"),
 )
@@ -60,6 +65,7 @@ async def moon(ctx: CommandContext) -> Any:
     risk=Risk.SAFE,
     guild_only=False,
     aliases=("moon_upcoming", "lunar_calendar"),
+    topic=MOON_TOPIC,
     params=(Param("days", "how far ahead to look", kind="integer",
                   required=False, default=60, min_value=1, max_value=365),),
     examples=("show the moon calendar", "moon phases for the next 90 days"),
@@ -87,6 +93,7 @@ async def moon_calendar(ctx: CommandContext, days: int = 60) -> Any:
     risk=Risk.WRITE,
     permission=Perm.MANAGE_GUILD,
     aliases=("fullmoon", "full_moon_alerts"),
+    topic=MOON_TOPIC,
     params=(
         Param("enabled", "on or off", kind="boolean"),
         Param("channel", "where to announce", kind="channel",

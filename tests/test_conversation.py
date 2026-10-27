@@ -13,7 +13,7 @@ from corbin.ai.conversation import (Conversation, has_content,
 
 class FakeLLM:
     class constants:
-        MODEL_MAIN = "m"; EFFORT_MAIN = "low"
+        MODEL_MAIN = MODEL_REPLY = MODEL_THINK = "m"; EFFORT_MAIN = "low"
 
 
 def suite_text(r: Results) -> None:
@@ -23,8 +23,8 @@ def suite_text(r: Results) -> None:
     r.ok("nested list", has_content([{"text": "x"}]))
     r.ok("empty list", not has_content([]))
 
-    r.check("known user", resolve_mentions("hi <@5>", users={"5": "Sam"}), "hi @Sam")
-    r.check("nickname form", resolve_mentions("hi <@!5>", users={"5": "Sam"}), "hi @Sam")
+    r.check("known user", resolve_mentions("hi <@5>", users={"5": "Lux"}), "hi @Lux")
+    r.check("nickname form", resolve_mentions("hi <@!5>", users={"5": "Lux"}), "hi @Lux")
     r.check("unknown user degrades", resolve_mentions("hi <@9>"), "hi @someone")
     r.check("role", resolve_mentions("<@&2>", roles={"2": "Mods"}), "@Mods")
     r.check("channel", resolve_mentions("<#3>", channels={"3": "general"}), "#general")
@@ -66,17 +66,17 @@ def suite_history(r: Results) -> None:
     conv = Conversation(FakeLLM(), soul_path="/nonexistent/SOUL.md")
     r.check("missing soul degrades to empty", conv.soul, "")
 
-    conv.record("c", "Sam", "hello")
+    conv.record("c", "Lux", "hello")
     conv.record("c", "Corbin", "hey")
-    conv.record("c", "Sam", "   ")
-    conv.record("c", "Sam", "")
+    conv.record("c", "Lux", "   ")
+    conv.record("c", "Lux", "")
     r.check("blank lines dropped", len(conv._channels["c"]), 2)
     e = conv.entries("c")[0]
-    r.check("entry records the author", e["author"], "Sam")
+    r.check("entry records the author", e["author"], "Lux")
     r.ok("entry is timestamped", e["timestamp"] is not None)
     r.ok("human entries not flagged as bot", not e["is_bot"])
     r.check("speaker labels", conv.transcript("c"),
-            "[Sam]: hello\n[Corbin]: hey")
+            "[Lux]: hello\n[Corbin]: hey")
     r.check("unknown channel is empty", conv.transcript("nope"), "")
     r.ok("highlight marks the target",
          "<<< YOU ARE REPLYING" in conv.transcript("c", highlight="hello"))
@@ -87,7 +87,7 @@ def suite_history(r: Results) -> None:
     # an offer. A caller unpacking entries itself broke when the entry
     # shape changed, which silently killed every conversational reply.
     r.check("last bot message found", conv.last_bot_message("c"), "hi")
-    conv.record("c", "Sam", "and another thing")
+    conv.record("c", "Lux", "and another thing")
     r.check("human messages do not shadow it",
             conv.last_bot_message("c"), "hi")
     conv.record("c", "Corbin", "newer", is_bot=True)
@@ -122,21 +122,21 @@ def suite_history(r: Results) -> None:
          "people's jokes)",
          not any("channel messages" in str(m["content"]).lower()
                  for m in msgs))
-    sp = conv.system_prompt(guild_name="g", channel_name="c", speaker="Sam",
+    sp = conv.system_prompt(guild_name="g", channel_name="c", speaker="Lux",
                             channel_context=conv.transcript("c"))
     r.ok("it goes in the system prompt, as background",
-         "background only" in sp and "[Sam]: hello" in sp)
+         "background only" in sp and "[Lux]: hello" in sp)
     r.ok("...told plainly to answer only the latest message",
          "Answer ONLY the latest message" in sp)
     r.ok("no context, no section",
          "background only" not in conv.system_prompt(
-             guild_name="g", channel_name="c", speaker="Sam"))
-    conv.record("c", "Sam", "what does SO mean")
+             guild_name="g", channel_name="c", speaker="Lux"))
+    conv.record("c", "Lux", "what does SO mean")
     r.ok("the message being answered isn't duplicated into the context",
          "what does SO mean" not in conv.transcript(
              "c", omit_latest="what does SO mean"))
     r.ok("...but stays when it isn't the latest line",
-         "[Sam]: hello" in conv.transcript("c", omit_latest="hello"))
+         "[Lux]: hello" in conv.transcript("c", omit_latest="hello"))
     r.ok("no invented assistant turn (it got repeated back: "
          "'Understood, I'm caught up.')",
          not any("caught up" in str(m["content"]).lower() for m in msgs
@@ -206,7 +206,7 @@ def suite_history(r: Results) -> None:
         persona_baked_in = True
 
         class constants:
-            MODEL_MAIN = "m"
+            MODEL_MAIN = MODEL_REPLY = MODEL_THINK = "m"
             EFFORT_MAIN = EFFORT_SEARCH = "low"
             EFFORT_THINK = "high"
 
@@ -232,12 +232,12 @@ def suite_history(r: Results) -> None:
 
 def suite_prompt(r: Results) -> None:
     conv = Conversation(FakeLLM(), soul_path="/nonexistent")
-    p = conv.system_prompt(guild_name="Riley", channel_name="general",
-                           speaker="Sam", known_names=["Sam", "Alex"])
-    r.ok("names the server", "Riley" in p)
+    p = conv.system_prompt(guild_name="Nightjar", channel_name="general",
+                           speaker="Lux", known_names=["Lux", "Juniper"])
+    r.ok("names the server", "Nightjar" in p)
     r.ok("names the channel", "general" in p)
-    r.ok("names the speaker", "Sam" in p)
-    r.ok("lists participants", "Alex" in p)
+    r.ok("names the speaker", "Lux" in p)
+    r.ok("lists participants", "Juniper" in p)
     r.ok("states the label rule", "[Name]:" in p)
     r.ok("forbids inventing names", "Never invent" in p)
     r.ok("forbids self-labelling", "do not prefix" in p.lower())
@@ -251,14 +251,14 @@ def suite_prompt(r: Results) -> None:
         r.ok("real SOUL.md loads", len(real.soul) > 1000)
         r.ok("persona precedes context",
              real.system_prompt(guild_name=None, channel_name=None,
-                                speaker="Sam").index("Current Context") > 100)
+                                speaker="Lux").index("Current Context") > 100)
 
 
 class RecordingLLM:
     """Captures the kwargs of the one call a reply makes."""
 
     class constants:
-        MODEL_MAIN = "m"
+        MODEL_MAIN = MODEL_REPLY = MODEL_THINK = "m"
         EFFORT_MAIN = "low"
         EFFORT_SEARCH = "low"
         EFFORT_THINK = "high"
@@ -320,7 +320,7 @@ def suite_platform(r: Results) -> None:
     """
     conv = Conversation(FakeLLM(), soul_path="/nonexistent")
     for include_soul in (True, False):
-        prompt = conv.system_prompt(speaker="Sam", guild_name="The Den",
+        prompt = conv.system_prompt(speaker="Lux", guild_name="The Den",
                                     channel_name="general",
                                     include_soul=include_soul)
         label = "with soul" if include_soul else "local model"
@@ -331,12 +331,46 @@ def suite_platform(r: Results) -> None:
              "Never say Discord" in prompt)
 
 
+def suite_streaming_awareness(r: Results) -> None:
+    """He knows about live TV and music videos only where streaming is on.
+
+    The command list is in no prompt, so "what do you have streaming on
+    tv" got "Nothing streaming right now." Told everywhere, he'd offer TV
+    in servers where the dispatcher refuses it.
+    """
+    from corbin.ai.conversation import STREAMING_LINE
+    conv = Conversation(FakeLLM(), soul_path="/nonexistent")
+    on = {"g-on": frozenset({"streaming"}), "g-voice": frozenset({"voice"})}
+    conv.features = lambda gid: on.get(gid, frozenset())
+
+    def prompt(gid, include_soul=True):
+        return conv.system_prompt(speaker="Quill", guild_name="Den",
+                                  channel_name="general", guild_id=gid,
+                                  include_soul=include_soul)
+
+    r.ok("allowlisted: knows (cloud)", STREAMING_LINE in prompt("g-on"))
+    r.ok("allowlisted: knows (local)",
+         STREAMING_LINE in prompt("g-on", include_soul=False))
+    r.ok("voice only: doesn't", STREAMING_LINE not in prompt("g-voice"))
+    r.ok("not allowlisted: doesn't", STREAMING_LINE not in prompt("g-off"))
+    r.ok("DM: doesn't", STREAMING_LINE not in prompt(None))
+    r.ok("says live TV and the music video",
+         "live TV" in STREAMING_LINE and "music video" in STREAMING_LINE)
+    r.ok("doesn't promise any video", "Not any other video" in STREAMING_LINE)
+
+    def broken(gid): raise RuntimeError("settings unreadable")
+    conv.features = broken
+    r.ok("a failed lookup says nothing", STREAMING_LINE not in prompt("g-on"))
+    conv.features = None
+    r.ok("unwired says nothing", STREAMING_LINE not in prompt("g-on"))
+
 SUITES = [
     ("conversation text helpers", suite_text),
     ("provider routing", suite_provider_routing),
     ("conversation history", suite_history),
     ("system prompt", suite_prompt),
     ("platform identity", suite_platform),
+    ("streaming awareness", suite_streaming_awareness),
 ]
 
 if __name__ == "__main__":

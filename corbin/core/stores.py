@@ -18,6 +18,8 @@ import os
 from pathlib import Path
 from typing import Any, Optional
 
+from . import crypto
+
 logger = logging.getLogger("corbin.stores")
 
 WARN_FILE = "spamblock_warnings.json"
@@ -26,11 +28,10 @@ USER_DATA_DIR = "user_data"
 
 def _read_json(path: Path) -> Optional[Any]:
     try:
-        with open(path, "r", encoding="utf-8-sig") as handle:
-            return json.load(handle)
+        return crypto.read_json(path)
     except FileNotFoundError:
         return None
-    except (json.JSONDecodeError, OSError):
+    except (ValueError, OSError):
         logger.warning("unreadable store: %s", path)
         return None
 

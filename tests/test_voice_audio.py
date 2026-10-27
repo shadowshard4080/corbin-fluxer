@@ -212,7 +212,133 @@ def suite_teardown(r: Results) -> None:
         voice_mod.TEARDOWN_STEP_TIMEOUT = saved
 
 
+def _real_loop(feed_chunks: int, *, queue_ms=None):
+    """Run voice.py's actual frame loop against a stub LiveKit and a fake
+    ffmpeg whose stdout holds ``feed_chunks`` frames. Returns a harness
+    to drive it."""
+    import sys, types
+    from corbin.core import voice as V
+
+    captured = []
+
+    class AudioSource:
+        def __init__(self, rate, channels, queue_size_ms=None):
+            self.queued_duration = 0.0
+            self.queue_ms = queue_size_ms
+
+        async def capture_frame(self, frame):
+            captured.append(frame.data)
+            await asyncio.sleep(0)
+
+    class AudioFrame:
+        def __init__(self, *, data, sample_rate, num_channels,
+                     samples_per_channel):
+            self.data = data
+
+    rtc = types.ModuleType("livekit.rtc")
+    rtc.AudioSource, rtc.AudioFrame = AudioSource, AudioFrame
+    lk = types.ModuleType("livekit")
+    lk.rtc = rtc
+    saved = {k: sys.modules.get(k) for k in ("livekit", "livekit.rtc")}
+    sys.modules["livekit"], sys.modules["livekit.rtc"] = lk, rtc
+
+    class Proc:
+        def __init__(self):
+            self.stdout = asyncio.StreamReader()
+            self.returncode = None
+            self.stdout.feed_data(ramp(feed_chunks))
+            self.stdout.feed_eof()
+
+        def kill(self):
+            self.returncode = -9
+
+        async def communicate(self):
+            return b"", b""
+
+    class Client:
+        _room = object()
+        _current_publication = None
+
+        def __init__(self):
+            self._resume_event = asyncio.Event()
+            self._resume_event.set()
+
+        async def _publish_track(self, src):
+            self.src = src
+
+        async def _run_ffmpeg_loop(self, source):
+            pass
+
+    procs = []
+
+    async def fake_exec(*a, **k):
+        procs.append(Proc())
+        return procs[-1]
+
+    source = types.SimpleNamespace(executable="ffmpeg", before_options="",
+                                   options="", path="u", num_channels=2,
+                                   sample_rate=48000)
+    if queue_ms:
+        source.corbin_queue_ms = queue_ms
+    client = Client()
+    old_exec = V.asyncio.create_subprocess_exec
+    V.asyncio.create_subprocess_exec = fake_exec
+
+    def restore():
+        V.asyncio.create_subprocess_exec = old_exec
+        for k, v in saved.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    ok = V.VoiceManager._apply_frame_loop(client)
+    client.procs = procs
+    return client, source, captured, ok, restore
+
+
+def suite_read_ahead(r: Results) -> None:
+    """Live 2026-10-20: "longest audio wait 4.94s, loop lag 3ms": the
+    song's audio arrived unevenly from YouTube and Corbin read it only as
+    fast as he played it. Now music reads ahead (AUDIO_READ_AHEAD), so a
+    slow patch drains a buffer instead of being heard."""
+    async def paused_then_resumed():
+        client, source, captured, ok, restore = _real_loop(250)
+        try:
+            client._resume_event.clear()        # paused before it starts
+            task = asyncio.ensure_future(client._run_ffmpeg_loop(source))
+            await asyncio.sleep(0.2)
+            drained = client.procs[0].stdout.at_eof()
+            buffered_while_paused = len(captured), drained
+            # Let it go: what's buffered plays out, then the end.
+            client._resume_event.set()
+            await asyncio.wait_for(task, 5)
+            return ok, buffered_while_paused, captured
+        finally:
+            restore()
+    ok, (played_while_paused, drained), captured = asyncio.run(
+        paused_then_resumed())
+    r.ok("the corrected loop is installed", ok)
+    r.check("paused: nothing played", played_while_paused, 0)
+    r.ok("...but the whole song was read into the buffer meanwhile, so "
+         "playback never waits on the source", drained)
+    r.check("resumed: every byte comes out, in order",
+            b"".join(captured), ramp(250))
+
+    async def tv_style():
+        client, source, captured, ok, restore = _real_loop(10, queue_ms=300)
+        try:
+            await asyncio.wait_for(client._run_ffmpeg_loop(source), 5)
+            return captured, client.src.queue_ms
+        finally:
+            restore()
+    captured, qms = asyncio.run(tv_style())
+    r.ok("TV / the video library (a short LiveKit queue) are left as they "
+         "were: no read-ahead, their ffmpeg also feeds the picture",
+         qms == 300 and b"".join(captured) == ramp(10))
+
+
 SUITES = [
+    ("audio: reads ahead of playback", suite_read_ahead),
     ("audio frame short reads", suite_short_reads),
     ("audio frame aligned reads", suite_clean_reads),
     ("audio frame end of stream", suite_tail),

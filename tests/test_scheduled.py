@@ -147,10 +147,25 @@ def suite_animal_delivery(r: Results) -> None:
         return
     r.ok("found the hourly animal job", True)
 
-    source = _ast.dump(job)
-    kwargs = {k.arg for n in _ast.walk(job)
+    r.ok("the job posts through the shared animal_post",
+         "animal_post" in _ast.dump(job))
+
+    # The post itself lives in animal_post (shared with image_search).
+    post = None
+    for node in _ast.walk(_ast.parse(
+            (root / "corbin" / "core" / "scheduled.py")
+            .read_text(encoding="utf-8"))):
+        if isinstance(node, _ast.AsyncFunctionDef) \
+                and node.name == "animal_post":
+            post = node
+            break
+    r.ok("found animal_post", post is not None)
+    if post is None:
+        return
+    source = _ast.dump(post)
+    kwargs = {k.arg for n in _ast.walk(post)
               if isinstance(n, _ast.Call) for k in n.keywords if k.arg}
-    r.ok("the bytes are fetched", "_fetch_bytes" in source)
+    r.ok("the bytes are fetched", "fetch_animal" in source)
     r.ok("...and uploaded as a file", "files" in kwargs)
     # This is the bug: a static URL handed to the embed.
     r.ok("the embed does NOT link the image url",
@@ -158,8 +173,31 @@ def suite_animal_delivery(r: Results) -> None:
     r.ok("credit is kept", "footer" in kwargs)
 
 
+def suite_animal_queries(r: Results) -> None:
+    """image_search sends plain animal requests to tinyfox, and only
+    those: anything more specific is a real image search."""
+    from corbin.core.scheduled import animal_for_query
+
+    for query, key in [("fox", "fox"), ("a fox", "fox"), ("foxes", "fox"),
+                       ("cute capybaras", "capy"), ("Wolves", "woof"),
+                       ("picture of a snow leopard", "snep"),
+                       ("show me a red panda please", "wah"),
+                       ("hyena", "yeen"), ("yeen", "yeen"),
+                       ("Pallas Cat", "manul"), ("puppies", "dog"),
+                       ("random otter pics", "ott"), ("mountain lion", "puma"),
+                       ("bunny", "bun"), ("african wild dog", "chi")]:
+        r.check(f"{query!r} -> tinyfox {key}", animal_for_query(query), key)
+    for query in ["fox news logo", "megan fox", "firefox", "teddy bear",
+                  "fox in the snow", "polar bear", "northern lights",
+                  "raven", "cat", "a wolf howling at the moon",
+                  "gummy bears", "lion king", "", "pictures"]:
+        r.ok(f"{query!r} stays a normal image search",
+             animal_for_query(query) is None)
+
+
 SUITES = [
     ("hourly animal delivery", suite_animal_delivery),
+    ("animal image queries", suite_animal_queries),
     ("animal roster", suite_animals),
     ("quote rendering", suite_quote),
     ("schedule timing", suite_timing),

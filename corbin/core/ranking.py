@@ -1,8 +1,10 @@
 """XP and levelling.
 
 State lives in ``user_data/<guild_id>/<user_id>.json`` under DATA_ROOT.
-Voice XP is not counted yet (it needs VOICE_STATE_UPDATE session
-tracking); the stored shape already has room for it.
+
+Milestone roles are per server (:class:`RankRoles`); a server that never
+changed them gets :data:`ROLE_TIERS` (the defaults, or RANK_ROLES_FILE).
+Voice XP is not counted yet.
 """
 
 from __future__ import annotations
@@ -103,20 +105,163 @@ def xp_for_message(content: str) -> int:
     return max(int(round(ly + frac * (uy - ly))), points[0][1])
 
 
-def role_for_level(level: int) -> Optional[tuple[str, int]]:
-    """Highest milestone role at or below ``level``."""
-    for threshold in sorted(ROLE_TIERS, reverse=True):
+def role_for_level(level: int, tiers: Optional[dict[int, tuple[str, int]]]
+                   = None) -> Optional[tuple[str, int]]:
+    """Highest milestone role at or below ``level``. ``tiers``: a
+    server's own (:meth:`RankRoles.tiers`); the defaults otherwise."""
+    tiers = ROLE_TIERS if tiers is None else tiers
+    for threshold in sorted(tiers, reverse=True):
         if level >= threshold:
-            return ROLE_TIERS[threshold]
+            return tiers[threshold]
     return None
 
 
-def next_role(level: int) -> Optional[tuple[int, str]]:
+def next_role(level: int, tiers: Optional[dict[int, tuple[str, int]]]
+              = None) -> Optional[tuple[int, str]]:
     """The next milestone above ``level``, as (level, name)."""
-    for threshold in sorted(ROLE_TIERS):
+    tiers = ROLE_TIERS if tiers is None else tiers
+    for threshold in sorted(tiers):
         if level < threshold:
-            return threshold, ROLE_TIERS[threshold][0]
+            return threshold, tiers[threshold][0]
     return None
+
+
+#: Per-server rank roles (owner, 2026-10-20): ``rank_roles`` in that
+#: guild's chat settings, ``{"tiers": {"<level>": [name, colour]},
+#: "retired": [names]}``. Absent = :data:`ROLE_TIERS`.
+MAX_TIERS = 25
+MAX_TIER_LEVEL = 1000
+MAX_RETIRED = 50
+DEFAULT_COLOUR = 0x99AAB5
+
+
+class RankRoles:
+    """A server's milestone roles: level -> (role name, colour).
+
+    A server starts on :data:`ROLE_TIERS` and gets its own copy on the
+    first change. Names a tier used to have are kept as ``retired`` so
+    the role can still be taken off members (``all_names``): renaming
+    "Moongazer" to "Moon Child" must not leave everyone holding both.
+    Unreadable or malformed settings fall back to the defaults with a
+    warning, since a server losing its roles silently would strip them.
+    """
+
+    KEY = "rank_roles"
+
+    def __init__(self, settings: Any) -> None:
+        self.settings = settings
+
+    def _raw(self, guild_id: str) -> dict:
+        try:
+            raw = self.settings.store.get(str(guild_id), self.KEY)
+        except Exception:
+            logger.warning("rank roles for %s unreadable; using the "
+                           "defaults", guild_id, exc_info=True)
+            return {}
+        return raw if isinstance(raw, dict) else {}
+
+    def custom(self, guild_id: Optional[str]) -> bool:
+        return bool(guild_id) and isinstance(
+            self._raw(str(guild_id)).get("tiers"), dict)
+
+    def tiers(self, guild_id: Optional[str]) -> dict[int, tuple[str, int]]:
+        if not guild_id:
+            return dict(ROLE_TIERS)
+        stored = self._raw(str(guild_id)).get("tiers")
+        if not isinstance(stored, dict):
+            return dict(ROLE_TIERS)
+        out: dict[int, tuple[str, int]] = {}
+        for level, value in stored.items():
+            try:
+                name, colour = value
+                out[int(level)] = (str(name), int(colour))
+            except (TypeError, ValueError):
+                logger.warning("rank roles for %s: bad tier %r=%r skipped",
+                               guild_id, level, value)
+        return out
+
+    def all_names(self, guild_id: Optional[str]) -> list[str]:
+        """Every name to strip when giving someone their tier: current
+        tiers plus retired ones."""
+        names = [n for n, _c in self.tiers(guild_id).values()]
+        retired = self._raw(str(guild_id)).get("retired") if guild_id \
+            else None
+        for name in retired if isinstance(retired, list) else ():
+            if str(name).lower() not in {n.lower() for n in names}:
+                names.append(str(name))
+        return names
+
+    def role_for(self, guild_id: Optional[str],
+                 level: int) -> Optional[str]:
+        role = role_for_level(level, self.tiers(guild_id))
+        return role[0] if role else None
+
+    def _save(self, guild_id: str, tiers: dict[int, tuple[str, int]],
+              retire: tuple[str, ...] = ()) -> None:
+        raw = self._raw(guild_id)
+        retired = [str(n) for n in raw.get("retired") or []
+                   if isinstance(n, str)]
+        current = {n.lower() for n, _c in tiers.values()}
+        for name in retire:
+            if name.lower() not in current and name not in retired:
+                retired.append(name)
+        retired = [n for n in retired if n.lower() not in current]
+        self.settings.store.set(str(guild_id), self.KEY, {
+            "tiers": {str(k): [v[0], v[1]] for k, v in sorted(tiers.items())},
+            "retired": retired[-MAX_RETIRED:],
+        })
+
+    def set(self, guild_id: str, level: int, name: str,
+            colour: Optional[int] = None) -> Optional[str]:
+        """Add or replace the tier at ``level``. Returns the name it
+        replaced, if any. Raises ValueError on a bad tier."""
+        level = int(level)
+        name = " ".join(str(name or "").split())[:100]
+        if not 1 <= level <= MAX_TIER_LEVEL:
+            raise ValueError(f"the level has to be 1 to {MAX_TIER_LEVEL}")
+        if not name:
+            raise ValueError("the role needs a name")
+        if name.lower() == "@everyone":
+            raise ValueError("that's not a role I can hand out")
+        tiers = self.tiers(guild_id)
+        for other, (other_name, _c) in tiers.items():
+            if other != level and other_name.lower() == name.lower():
+                raise ValueError(f"**{other_name}** is already the role "
+                                 f"for level {other}")
+        if level not in tiers and len(tiers) >= MAX_TIERS:
+            raise ValueError(f"a server can have up to {MAX_TIERS} rank "
+                             "roles")
+        old = tiers.get(level)
+        if colour is None:
+            colour = old[1] if old else DEFAULT_COLOUR
+        tiers[level] = (name, int(colour) & 0xFFFFFF)
+        replaced = old[0] if old and old[0].lower() != name.lower() else None
+        self._save(guild_id, tiers, (replaced,) if replaced else ())
+        logger.info("rank roles for %s: level %d = %s%s", guild_id, level,
+                    name, f" (was {replaced})" if replaced else "")
+        return replaced
+
+    def remove(self, guild_id: str, level: int) -> Optional[str]:
+        """Drop the tier at ``level``; its name, or None if none."""
+        tiers = self.tiers(guild_id)
+        old = tiers.pop(int(level), None)
+        if old is None:
+            return None
+        self._save(guild_id, tiers, (old[0],))
+        logger.info("rank roles for %s: level %d (%s) removed", guild_id,
+                    level, old[0])
+        return old[0]
+
+    def reset(self, guild_id: str) -> None:
+        """Back to the defaults; any custom names are retired."""
+        mine = [n for n, _c in self.tiers(guild_id).values()]
+        self._save(guild_id, dict(ROLE_TIERS), tuple(mine))
+        raw = self._raw(guild_id)
+        # The defaults, stored as "no custom tiers", keeping the retired
+        # list so the old custom roles are still stripped on sync.
+        self.settings.store.set(str(guild_id), self.KEY,
+                                {"retired": raw.get("retired") or []})
+        logger.info("rank roles for %s back to the defaults", guild_id)
 
 
 @dataclass
@@ -248,6 +393,8 @@ class XPAccumulator:
         self.window = window
         #: (guild, user) -> [pending_xp, pending_messages, window_started]
         self._pending: dict[tuple[str, str], list] = {}
+        #: ((guild, user), level_before, level_after), oldest first
+        self._level_ups: list[tuple[tuple[str, str], int, int]] = []
 
     def record(self, guild_id: str, user_id: str, content: str) -> None:
         key = (str(guild_id), str(user_id))
@@ -287,10 +434,10 @@ class XPAccumulator:
         if rank.level > before:
             logger.info("level up: %s in %s -> %d (%s)", user_id, guild_id,
                         rank.level, rank.role_name)
-        self.last_level_up = (key, before, rank.level) if rank.level > before \
-            else getattr(self, "last_level_up", None)
+            # A queue, not one slot: flush_due can level several people
+            # at once, and a slot kept only the last of them.
+            self._level_ups.append((key, before, rank.level))
 
     def pop_level_up(self) -> Optional[tuple[tuple[str, str], int, int]]:
-        value = getattr(self, "last_level_up", None)
-        self.last_level_up = None
-        return value
+        """The oldest unannounced level-up, or None."""
+        return self._level_ups.pop(0) if self._level_ups else None

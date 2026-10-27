@@ -2,8 +2,8 @@
 
 Counts what Corbin did, and posts a summary once a day. The Discord build
 paged users/servers behind buttons; Fluxer has no components, so the
-overview carries the top entries inline and ``digest`` takes a section
-parameter.
+overview carries the rankings inline (one embed) and ``digest`` takes a
+section parameter for the longer lists.
 
 The reset is a **subtraction of the posted snapshot**, not a wipe: activity
 that happens during the send would otherwise be lost. Posting is guarded by
@@ -43,6 +43,9 @@ def digest_now() -> datetime:
 class Counters:
     messages_sent: int = 0
     commands_run: int = 0
+    web_searches: int = 0
+    #: Seconds spent connected to voice, summed over every guild.
+    voice_seconds: float = 0.0
     users: dict = field(default_factory=dict)
     guilds: dict = field(default_factory=dict)
 
@@ -52,6 +55,8 @@ class Counters:
         return cls(
             messages_sent=int(data.get("messages_sent") or 0),
             commands_run=int(data.get("commands_run") or 0),
+            web_searches=int(data.get("web_searches") or 0),
+            voice_seconds=float(data.get("voice_seconds") or 0.0),
             users=dict(data.get("users") or {}),
             guilds=dict(data.get("guilds") or {}),
         )
@@ -59,11 +64,14 @@ class Counters:
     def to_dict(self) -> dict:
         return {"messages_sent": self.messages_sent,
                 "commands_run": self.commands_run,
+                "web_searches": self.web_searches,
+                "voice_seconds": round(self.voice_seconds, 1),
                 "users": self.users, "guilds": self.guilds}
 
     @property
     def total(self) -> int:
-        return self.messages_sent + self.commands_run
+        return (self.messages_sent + self.commands_run + self.web_searches
+                + (1 if self.voice_seconds >= 60 else 0))
 
     def top_users(self, limit: int = TOP_N) -> list[tuple[str, dict]]:
         return sorted(self.users.items(),
@@ -78,6 +86,9 @@ class Counters:
         self.messages_sent = max(0, self.messages_sent -
                                  snapshot.messages_sent)
         self.commands_run = max(0, self.commands_run - snapshot.commands_run)
+        self.web_searches = max(0, self.web_searches - snapshot.web_searches)
+        self.voice_seconds = max(0.0, self.voice_seconds -
+                                 snapshot.voice_seconds)
         for bucket, taken in (("users", snapshot.users),
                               ("guilds", snapshot.guilds)):
             live = getattr(self, bucket)
@@ -145,6 +156,15 @@ class DigestStore:
             if guild_name:
                 guild["name"] = guild_name
         self.flush()
+
+    def record_search(self) -> None:
+        self.counters.web_searches += 1
+        self.flush()
+
+    def record_voice(self, seconds: float) -> None:
+        if seconds > 0:
+            self.counters.voice_seconds += float(seconds)
+            self.flush()
 
     # -- posting ----------------------------------------------------------
 

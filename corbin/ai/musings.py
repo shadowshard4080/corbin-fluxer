@@ -303,7 +303,11 @@ class Musings:
         parts.append(_FORMAT)
 
         constants = self.llm.constants
-        soul = getattr(self.conversation, "soul", "") or None
+        # The persona plus the "you are on Fluxer" block: the persona alone
+        # left him guessing which platform he was on.
+        build = getattr(self.conversation, "standalone_system", None)
+        soul = (build() if callable(build)
+                else getattr(self.conversation, "soul", "")) or None
         try:
             result = await self.llm.call(
                 model=constants.MODEL_MAIN, system=soul,

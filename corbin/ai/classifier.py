@@ -23,6 +23,7 @@ from ..core.dispatch import Intent
 from ..core.registry import Registry, Risk
 from ..identity import NAME as BOT_NAME
 from .json_utils import coerce_bool, coerce_float, extract_json_object
+from ..core.logtext import said
 
 logger = logging.getLogger("corbin.classifier")
 
@@ -55,11 +56,23 @@ provide. "What's the weather in Oslo?", "who is @sam?", "what time is it in
 Tokyo?" are all is_instruction = true -- the user wants the answer, and
 phrasing a request politely does not make it hypothetical.
 
+A SUGGESTION OR INVITATION TO {NAME} IS AN INSTRUCTION. "you should join
+the gaming vc", "come hang out in voice", "why don't you play some music",
+"you could check the weather" all ask {NAME} to do it -- casual phrasing is
+still a request. So is a POLITE QUESTION with a concrete action: "can you
+join vc?", "could you play some lofi?", "would you check the weather in
+Oslo?", "mind skipping this song?" are requests, worded kindly. Only a
+suggestion aimed at SOMEONE ELSE ("someone should ban Steve", "Sam should
+play music") is not.
+
 Set "is_instruction": false ONLY when the message is not a live request:
 - joking or exaggerating        -> "lol ban him", "someone should ban Steve"
 - hypothetical or conditional   -> "what if you banned me", "imagine if"
-- asking whether you CAN do it  -> "can you even ban people?", "do you have
-  weather?" (about your abilities, NOT about the data itself)
+- asking about your ABILITIES in general, not for a thing now ->
+  "can you even ban people?", "are you able to play music?", "do you have
+  weather?", "is it possible for you to join voice?" (a general ability
+  question, often with "even", "able to", "possible" or no specific target.
+  "can you play X" naming the thing to do is a request, see above)
 - about {NAME} in third person  -> "{NAME} would totally ban him"
 - quoting or reminiscing        -> "he told me to ban you", "remember when"
 - narrating a past action       -> "I banned him yesterday"
@@ -85,6 +98,26 @@ msg: What's the weather in Denver, CO?
 {"command":"weather","args":{"location":"Denver, CO"},"confidence":0.97,
  "is_instruction":true,"why_not":""}
 
+msg: you should join the gaming vc
+{"command":"voice-chat","args":{"channel":"gaming vc"},"confidence":0.9,
+ "is_instruction":true,"why_not":""}
+
+msg: {NAME} can you join vc?
+{"command":"voice-chat","args":{},"confidence":0.9,
+ "is_instruction":true,"why_not":""}
+
+msg: {NAME}, what do you have streaming on tv
+{"command":"tv-channels","args":{},"confidence":0.9,
+ "is_instruction":true,"why_not":""}
+
+msg: Will that be a full pot?
+{"command":null,"args":{},"confidence":0.0,"is_instruction":false,
+ "why_not":"about cooking, not the moon"}
+
+msg: this is the entire log (again), can you look for it?
+{"command":null,"args":{},"confidence":0.0,"is_instruction":false,
+ "why_not":"a pasted file, not the server's logging"}
+
 msg: can you even ban people?
 {"command":null,"args":{},"confidence":0.0,"is_instruction":false,
  "why_not":"asking about capability"}
@@ -95,6 +128,10 @@ msg: hey what's up
 RULES
 - Respond with ONLY the JSON object. No prose, no code fences.
 - Never invent a command name that is not in the list.
+- One shared word is not a match. Pick a command only when the message is
+  about what that command does: "full" in "a full pot" is not the moon, a
+  "log" someone pasted is not server logging, and "TV" means the live TV
+  channels, not a video stream.
 - Never invent argument values the user did not supply -- omit them instead.
 - Keep the user's wording for user/role arguments (e.g. "@Steve"); do not
   guess numeric ids.
@@ -151,7 +188,8 @@ def parse_intent(raw: str, registry: Registry) -> Intent:
     """Turn raw model output into a validated :class:`Intent`."""
     data = extract_json_object(raw)
     if not data:
-        logger.warning("classifier returned unparseable output: %r", raw[:200])
+        logger.warning("classifier returned unparseable output: %s",
+                       said(raw, 200))
         return Intent(command=None, confidence=0.0, directive=False,
                       why_not="unparseable classifier output")
 

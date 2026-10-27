@@ -102,10 +102,45 @@ def suite_chatban(r: Results) -> None:
         r.check("corrupt file starts empty", len(ChatbanStore(tmp)), 0)
 
 
+def suite_chatban_in_dm(r: Results) -> None:
+    """The chatban list is global and keyed by id, so the owner can use it
+    from a DM. A name can't be looked up there, and must never be stored
+    as if it were an id."""
+    import asyncio
+    from types import SimpleNamespace
+    from _harness import member
+    from corbin.core.context import Surface
+    from corbin.core.permissions import Perm
+    from corbin.core.risk import Decision, assess
+    import corbin.commands.moderation  # noqa: registers chatban
+    from corbin.core.registry import registry
+
+    spec = registry.get("chatban")
+    r.ok("chatban works in DMs", spec is not None and not spec.guild_only)
+    owner, alice = member("o"), member("alice", perms=Perm.NONE)
+    v = assess(spec, surface=Surface.PREFIX, invoker=owner,
+               args={"user": "123456789"}, is_bot_owner=True, in_guild=False)
+    r.check("the owner's confirmed chatban runs from a DM", v.decision,
+            Decision.EXECUTE)
+    v = assess(spec, surface=Surface.PREFIX, invoker=alice,
+               args={"user": "123456789"}, in_guild=False)
+    r.check("...and is still owner-only there", v.decision, Decision.DENIED)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        store = ChatbanStore(tmp)
+        ctx = SimpleNamespace(extras={"chatbans": store}, guild_id=None)
+        out = asyncio.run(spec.handler(ctx, user="123456789"))
+        r.ok("an id is chatbanned", "123456789" in store and "stop" in out)
+        out = asyncio.run(spec.handler(ctx, user="Steve"))
+        r.ok("a bare name in a DM is refused, not stored",
+             "Steve" not in store and len(store) == 1 and "id" in out)
+
+
 SUITES = [
     ("ban durations", suite_duration),
     ("timed ban store", suite_store),
     ("chatbans", suite_chatban),
+    ("chatbans: from a DM", suite_chatban_in_dm),
 ]
 
 if __name__ == "__main__":

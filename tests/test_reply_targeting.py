@@ -35,8 +35,8 @@ def build():
     cache.put(CachedMessage(id="bot_msg", channel_id="c", author_id=ME,
                             author_name="Corbin", content="hi",
                             attachments=()))
-    cache.put(CachedMessage(id="laz_msg", channel_id="c", author_id="robin",
-                            author_name="Robin", content="yo",
+    cache.put(CachedMessage(id="kit_msg", channel_id="c", author_id="kit",
+                            author_name="Kit", content="yo",
                             attachments=()))
     return cache
 
@@ -53,20 +53,20 @@ async def reply_is_to_bot(cache, adapter, ref, me_id=ME):
 
 
 def suite_reply_target(r: Results) -> None:
-    cache, adapter = build(), Adapter({"old_bot": ME, "old_laz": "robin"})
+    cache, adapter = build(), Adapter({"old_bot": ME, "old_kit": "kit"})
 
     def check(ref):
         return asyncio.run(reply_is_to_bot(cache, adapter, ref))
 
     r.ok("a reply to Corbin counts", check("bot_msg"))
-    r.ok("a reply to someone else does not", not check("laz_msg"))
+    r.ok("a reply to someone else does not", not check("kit_msg"))
     r.ok("no reference at all does not", not check(None))
     r.check("a cached answer costs no API call", adapter.calls, [])
 
     # The cache is small; a reply to anything older must still work.
     r.ok("an uncached reply to Corbin is looked up", check("old_bot"))
-    r.ok("...and one to someone else is not his", not check("old_laz"))
-    r.check("those did hit the API", adapter.calls, ["old_bot", "old_laz"])
+    r.ok("...and one to someone else is not his", not check("old_kit"))
+    r.check("those did hit the API", adapter.calls, ["old_bot", "old_kit"])
 
     # Unknown even after asking: answering a stranger's reply to a
     # stranger is the worse mistake.
@@ -93,7 +93,7 @@ def suite_ai_channel(r: Results) -> None:
     # Mirrors bot.py: uncertainty ANSWERS. An unverifiable reference
     # used to mean silence, and silence in the ask-Corbin channel is
     # the worse failure.
-    authors = {"bot_msg": ME, "laz_msg": "robin"}
+    authors = {"bot_msg": ME, "kit_msg": "kit"}
 
     def aimed_elsewhere(message, raw):
         ref = getattr(message, "reference_id", None)
@@ -123,12 +123,12 @@ def suite_ai_channel(r: Results) -> None:
          decide(Msg("thanks", ref="bot_msg"), Raw(), True, to_corbin=True))
 
     r.ok("a reply to another member is ignored",
-         not decide(Msg("lol yeah", ref="laz_msg"), Raw(), True))
+         not decide(Msg("lol yeah", ref="kit_msg"), Raw(), True))
     r.ok("a message mentioning another member is ignored",
-         not decide(Msg("@Robin you there"), Raw(["robin"]), True))
+         not decide(Msg("@Kit you there"), Raw(["kit"]), True))
     # Naming both means he was included on purpose.
     r.ok("mentioning Corbin and someone else is answered",
-         decide(Msg(f"{ME} ask @Robin"), Raw([ME, "robin"]), True))
+         decide(Msg(f"{ME} ask @Kit"), Raw([ME, "kit"]), True))
 
     # Outside an AI channel nothing changes.
     r.ok("an ordinary channel ignores chatter",
@@ -140,7 +140,7 @@ def suite_ai_channel(r: Results) -> None:
     r.ok("an unverifiable reply is answered, not ignored",
          decide(Msg("what about this", ref="vanished"), Raw(), True))
     r.ok("...while a verified reply to someone else is still ignored",
-         not decide(Msg("lol", ref="laz_msg"), Raw(), True))
+         not decide(Msg("lol", ref="kit_msg"), Raw(), True))
 
 
 SUITES = [

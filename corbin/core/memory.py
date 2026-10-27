@@ -19,7 +19,9 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Callable, Iterable, Optional
+
+from . import crypto
 
 logger = logging.getLogger("corbin.memory")
 
@@ -45,11 +47,14 @@ def _read(path: Path, default: dict, label: str) -> dict:
     if not path.exists():
         return dict(default)
     try:
-        with open(path, "r", encoding="utf-8-sig") as handle:
-            data = json.load(handle)
+        data = crypto.read_json(path)
         if isinstance(data, dict):
             return data
         raise ValueError("not an object")
+    except crypto.DataKeyError:
+        # Never "start fresh" here: the next save would overwrite every
+        # encrypted fact with an empty file.
+        raise
     except Exception:
         # Quarantine rather than overwrite: these facts are unrecoverable.
         broken = path.with_suffix(f".corrupt.{int(time.time())}.json")
@@ -63,11 +68,8 @@ def _read(path: Path, default: dict, label: str) -> dict:
 
 def _write(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as handle:
-            json.dump(data, handle, indent=2, default=str)
-        os.replace(tmp, path)
+        crypto.write_json(path, data, indent=2, default=str)
     except OSError:
         logger.exception("could not persist %s", path)
 
@@ -197,10 +199,63 @@ class ServerMemory:
         return changed
 
 
+class MemoryOptOut:
+    """People who asked Corbin not to remember them ("don't remember me",
+    owner, 2026-10-20).
+
+    Global, like the voice opt-out, and kept beside it in the chat
+    settings (``_memory_optout``). Fluxer gives a bot no way to see that
+    someone blocked it (the relationships API is user-only and a failed
+    DM looks the same as closed DMs), so this is the control that the
+    privacy policy points people at instead.
+    """
+
+    BUCKET = "_memory_optout"
+
+    def __init__(self, settings: Any) -> None:
+        self.settings = settings
+
+    def __call__(self, user_id: str) -> bool:
+        return self.opted_out(user_id)
+
+    def opted_out(self, user_id: str) -> bool:
+        try:
+            return bool(self.settings.store.get(self.BUCKET, str(user_id),
+                                                False))
+        except Exception:
+            # Privacy fails closed: unreadable means don't remember.
+            logger.warning("memory opt-out unreadable; not remembering %s",
+                           user_id, exc_info=True)
+            return True
+
+    def set(self, user_id: str, out: bool) -> None:
+        if out:
+            self.settings.store.set(self.BUCKET, str(user_id), True)
+        else:
+            self.settings.store.unset(self.BUCKET, str(user_id))
+        logger.info("memory: %s opted %s", user_id,
+                    "out" if out else "back in")
+
+
 class MemoryStore:
-    def __init__(self, root: str | os.PathLike[str]) -> None:
+    def __init__(self, root: str | os.PathLike[str], *,
+                 opted_out: Optional[Callable[[str], bool]] = None) -> None:
         self.users = Path(root) / "user_memories"
         self.servers = Path(root) / "server_memories"
+        #: "Don't remember me" (:class:`MemoryOptOut`). Checked in
+        #: save_user, so every writer honours it: extraction, the
+        #: reminders' timezone, a Discord history claim.
+        self.opted_out = opted_out
+
+    def is_opted_out(self, user_id: str) -> bool:
+        if self.opted_out is None:
+            return False
+        try:
+            return bool(self.opted_out(str(user_id)))
+        except Exception:
+            logger.warning("memory opt-out check failed for %s; not "
+                           "remembering them", user_id, exc_info=True)
+            return True
 
     # -- users ------------------------------------------------------------
 
@@ -214,14 +269,24 @@ class MemoryStore:
         return UserMemory.from_dict(data, str(user_id))
 
     def save_user(self, memory: UserMemory) -> None:
+        if self.is_opted_out(memory.user_id):
+            logger.info("memory: not saving %s (opted out)", memory.user_id)
+            return
         _write(self.user_path(memory.user_id), memory.to_dict())
 
     def forget_user(self, user_id: str) -> bool:
+        """Delete their file and any quarantined copies of it. True if
+        there was anything to delete."""
         path = self.user_path(user_id)
-        if path.exists():
-            path.unlink()
-            return True
-        return False
+        gone = False
+        for victim in [path, *self.users.glob(
+                f"{_safe(user_id)}.corrupt.*.json")]:
+            try:
+                victim.unlink()
+                gone = True
+            except FileNotFoundError:
+                pass
+        return gone
 
     # -- servers ----------------------------------------------------------
 

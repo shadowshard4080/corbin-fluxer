@@ -72,6 +72,10 @@ class Member:
     roles: Sequence[Role] = field(default_factory=tuple)
     joined_at: Optional[_dt.datetime] = None
     is_guild_owner: bool = False
+    #: Server nickname. Fluxer shows nickname > global name > username, and
+    #: so does display_name; without it he called people by their account
+    #: name instead of the name they use in the server.
+    nick: Optional[str] = None
 
     @property
     def id(self) -> str:
@@ -79,7 +83,7 @@ class Member:
 
     @property
     def display_name(self) -> str:
-        return self.user.display_name
+        return self.nick or self.user.display_name
 
     @property
     def is_bot(self) -> bool:
@@ -190,6 +194,9 @@ class Embed:
     author: Optional[str] = None
     timestamp: Optional[_dt.datetime] = None
     fields: list[EmbedField] = field(default_factory=list)
+    #: Reaction controls (``core.reactions.Controls``). Not rendered: the
+    #: adapter adds the reactions after sending and registers the panel.
+    controls: Optional[Any] = None
 
     def add_field(self, name: str, value: str, inline: bool = False) -> "Embed":
         self.fields.append(EmbedField(name=name, value=value, inline=inline))
@@ -242,6 +249,9 @@ class Response:
     private_notice: Optional[str] = "Sent that to your DMs."
     #: Files to upload, as (filename, bytes).
     files: Sequence[tuple[str, bytes]] = field(default_factory=tuple)
+    #: Message id to post this as a reply to (same channel). Only applies
+    #: to a new message; an edit can't change what it replies to.
+    reply_to: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.content is None and self.embed is None and not self.embeds:

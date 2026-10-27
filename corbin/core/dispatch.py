@@ -24,7 +24,8 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from typing import AbstractSet, Any, Mapping, Optional, Protocol, Sequence
+from typing import (AbstractSet, Any, Callable, Mapping, Optional, Protocol,
+                    Sequence)
 
 from .confirm import (PendingStore, Undoable, is_affirmative, is_negative,
                       is_undo)
@@ -32,6 +33,8 @@ from .context import CommandContext, Member, Message, Surface
 from .permissions import Perm
 from .registry import CommandSpec, ParamError, Registry, Risk
 from .risk import Assessment, Decision, TargetProfile, assess
+
+from .logtext import said
 
 logger = logging.getLogger("corbin.dispatch")
 
@@ -163,6 +166,10 @@ class DispatchResult:
     converse: bool = False
     #: Set when the user asked to undo; the executor performs it.
     undo: Optional["Undoable"] = None
+    #: A command the classifier guessed at but wasn't sure of. Nothing
+    #: ran; the reply ends with "Did you mean: ...?" naming it
+    #: (``command_help.did_you_mean``).
+    suggest: Optional[CommandSpec] = None
 
 
 def _summarise(spec: CommandSpec, args: Mapping[str, Any],
@@ -206,6 +213,7 @@ class Dispatcher:
         store: Optional[PendingStore] = None,
         bot_owner_id: Optional[str] = None,
         grants: "Optional[Mapping[str, AbstractSet[str]]]" = None,
+        features: "Optional[Callable[[Optional[str]], AbstractSet[str]]]" = None,
     ) -> None:
         self.registry = registry
         self.classifier = classifier
@@ -216,6 +224,20 @@ class Dispatcher:
         #: person may run without the guild permission the command
         #: normally needs. Narrower than granting them that permission.
         self.grants: Mapping[str, AbstractSet[str]] = dict(grants or {})
+        #: guild id -> features the owner's allowlist turns on there
+        #: (``FeatureAllowlist.enabled``). None: nothing is on anywhere.
+        self.features = features
+
+    def _features(self, guild_id: Optional[str]) -> AbstractSet[str]:
+        if self.features is None or not guild_id:
+            return frozenset()
+        try:
+            return self.features(guild_id)
+        except Exception:
+            # Default deny: an unreadable allowlist allows nothing.
+            logger.warning("allowlist lookup failed for %s", guild_id,
+                           exc_info=True)
+            return frozenset()
 
     # -- entry point ------------------------------------------------------
 
@@ -228,6 +250,7 @@ class Dispatcher:
         guild_id: Optional[str],
         directly_invoked: bool,
         mention_ids: Optional[Mapping[str, str]] = None,
+        spoken: bool = False,
     ) -> DispatchResult:
         """Decide what to do with one directly-invoked message.
 
@@ -236,12 +259,17 @@ class Dispatcher:
         risk check, because the check profiles the target by id: given a
         name, the lookup found nobody and every target gate (staff,
         hierarchy, owner, bot, self) was skipped.
+
+        ``spoken``: heard in voice chat, not typed. Staff, owner-only and
+        destructive commands are refused for it in ``risk.assess``,
+        including when the spoken word is the "yes" to a confirmation.
         """
         user_id = invoker.id
 
         # A pending confirmation or undo owns the next word from this user.
         replied = await self._resume(text, channel_id=channel_id, user_id=user_id,
-                                     invoker=invoker, guild_id=guild_id)
+                                     invoker=invoker, guild_id=guild_id,
+                                     spoken=spoken)
         if replied is not None:
             return replied
 
@@ -261,6 +289,10 @@ class Dispatcher:
             hint_non_directive=has_non_directive_markers(text),
         )
         if not intent.matched:
+            # Logged: "what do you have streaming on tv" matched nothing and
+            # the log said so only by the absence of an AI dispatch line.
+            logger.info("AI dispatch | no command for %s%s", said(text),
+                        f" ({intent.why_not})" if intent.why_not else "")
             return DispatchResult(handled=False, converse=True,
                                   message="no command matched")
 
@@ -268,6 +300,30 @@ class Dispatcher:
         if spec is None or not spec.ai_invocable:
             return DispatchResult(handled=False, converse=True,
                                   message=f"unknown command {intent.command!r}")
+
+        # Gate 4: the message has to be about the command's subject.
+        if not spec.on_topic(text):
+            logger.info("AI dispatch | %s off topic for %s, conversing",
+                        spec.name, said(text))
+            return DispatchResult(handled=False, converse=True,
+                                  suggest=spec,
+                                  message=f"{spec.name} off topic")
+
+        # Gate 5: a server-only command matched in a DM. Every DM is
+        # directly invoked and the shape gate is permissive, so ordinary
+        # chat ("three takeaways from FIRA" for homework) reaches the
+        # classifier, and a false match used to end in a flat "That only
+        # works in a server, not in DMs" instead of an answer. Converse
+        # instead, with the command set aside: the help marks it
+        # server-only, so a real "play lofi" in a DM still gets told why.
+        # Nothing could run here anyway; typed "yes" and ``direct`` keep
+        # the hard refusal in ``risk.assess``.
+        if spec.guild_only and not guild_id:
+            logger.info("AI dispatch | %s is server-only, conversing in DM "
+                        "for %s", spec.name, said(text))
+            return DispatchResult(handled=False, converse=True,
+                                  decision=Decision.NOT_A_COMMAND,
+                                  spec=spec, message="server-only in a DM")
 
         try:
             args = spec.coerce_args(intent.args)
@@ -287,12 +343,57 @@ class Dispatcher:
             is_bot_owner=(self.bot_owner_id is not None
                           and user_id == self.bot_owner_id),
             grants=self.grants.get(str(user_id), frozenset()),
+            spoken=spoken, features=self._features(guild_id),
+            in_guild=bool(guild_id),
         )
-        logger.info("AI dispatch | %s | user=%s", verdict.explain(), user_id)
+        logger.info("AI dispatch%s | %s | user=%s",
+                    " (voice)" if spoken else "", verdict.explain(), user_id)
 
         return self._apply(verdict, spec, args, target,
                            channel_id=channel_id, user_id=user_id,
                            guild_id=guild_id, intent=intent)
+
+    def direct(
+        self, command: str, args: Mapping[str, Any], *, invoker: Member,
+        guild_id: Optional[str],
+    ) -> DispatchResult:
+        """Run a known command without the classifier, hard gates intact.
+
+        For phrases matched deterministically (``corbin_unsilence`` in a
+        silenced channel), where a classifier miss would leave no way out.
+        Same checks as a "yes" to a confirmation.
+        """
+        spec = self.registry.get(command)
+        if spec is None:
+            return DispatchResult(handled=True,
+                                  message="That command vanished on me.")
+        user_id = invoker.id
+        verdict = assess(
+            spec, surface=Surface.PREFIX, invoker=invoker, args=args,
+            confidence=1.0, directive=True, target=None,
+            is_bot_owner=(self.bot_owner_id is not None
+                          and user_id == self.bot_owner_id),
+            grants=self.grants.get(str(user_id), frozenset()),
+            features=self._features(guild_id),
+            in_guild=bool(guild_id),
+        )
+        logger.info("direct dispatch | %s | user=%s", verdict.explain(),
+                    user_id)
+        if verdict.decision is not Decision.EXECUTE:
+            message = verdict.reason
+            if verdict.decision is Decision.DENIED:
+                needed = getattr(verdict, "missing_permission", None)
+                names = [p.name.replace("_", " ").title()
+                         for p in Perm if p.value and needed and (needed & p)]
+                message = ("you don't have permission for that one"
+                           + (f" (needs {', '.join(names[:2])})"
+                              if names else ""))
+            return DispatchResult(handled=True, decision=verdict.decision,
+                                  assessment=verdict, spec=spec, args=args,
+                                  message=message)
+        return DispatchResult(handled=True, decision=Decision.EXECUTE,
+                              assessment=verdict, spec=spec, args=dict(args),
+                              message=spec.name)
 
     # -- internals --------------------------------------------------------
 
@@ -348,8 +449,12 @@ class Dispatcher:
 
         if verdict.decision is Decision.NOT_A_COMMAND:
             # Banter. Fall through to conversation -- never offer to execute.
+            # The spec rides along so the reply can be honest about it:
+            # with nothing said, the model denied having the ability
+            # ("I'm text-only") to "you should join the gaming vc".
             return DispatchResult(handled=False, converse=True,
                                   decision=verdict.decision, assessment=verdict,
+                                  spec=spec, args=args,
                                   message=intent.why_not or "read as banter")
 
         if verdict.decision is Decision.DENIED:
@@ -377,6 +482,16 @@ class Dispatcher:
                 spec=spec, args=args, message=verdict.reason,
             )
 
+        if (verdict.decision is Decision.CONFIRM and spec.risk is Risk.SAFE
+                and verdict.confidence < verdict.threshold):
+            # A read-only command the classifier isn't sure of: answer the
+            # message and offer the command after, instead of a yes/no
+            # prompt about something they probably never asked for.
+            return DispatchResult(handled=False, converse=True,
+                                  decision=verdict.decision,
+                                  assessment=verdict, suggest=spec,
+                                  message="not sure it was a request")
+
         if verdict.decision is Decision.CONFIRM:
             self.store.put(
                 guild_id=guild_id, channel_id=channel_id, user_id=user_id,
@@ -396,7 +511,7 @@ class Dispatcher:
 
     async def _resume(
         self, text: str, *, channel_id: str, user_id: str,
-        invoker: Member, guild_id: Optional[str],
+        invoker: Member, guild_id: Optional[str], spoken: bool = False,
     ) -> Optional[DispatchResult]:
         """Handle 'yes'/'no'/'undo' replies to our own earlier prompt."""
         if is_undo(text):
@@ -432,6 +547,8 @@ class Dispatcher:
                 is_bot_owner=(self.bot_owner_id is not None
                               and user_id == self.bot_owner_id),
                 grants=self.grants.get(str(user_id), frozenset()),
+                spoken=spoken, features=self._features(guild_id),
+            in_guild=bool(guild_id),
             )
             if verdict.decision is not Decision.EXECUTE:
                 return DispatchResult(

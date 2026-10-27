@@ -51,7 +51,7 @@ def find_ephemeris(*roots: str | os.PathLike[str]) -> Optional[Path]:
             continue
         base = Path(root)
         for name in EPHEMERIS_NAMES:
-            for candidate in (base / name,):
+            for candidate in (base / name, base / "data" / name):
                 if candidate.is_file():
                     return candidate
     return None

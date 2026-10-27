@@ -1,17 +1,20 @@
 """Small utilities: progress, birthday jams, literature clock, image search,
-invite, leave, messager, verify, echo."""
+invite, leave, messager, echo."""
 
 from __future__ import annotations
 
 import calendar
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from ..identity import NAME
 from ..core.context import CommandContext, Embed, Response
 from ..core.permissions import Perm
 from ..core.registry import Param, Risk, command
+from ..identity import NAME
+
+logger = logging.getLogger("corbin.util")
 
 BAR_WIDTH = 24
 #: Fluxer's message limit, same as Discord's.
@@ -172,6 +175,18 @@ async def literature_clock(ctx: CommandContext) -> Any:
     return embed
 
 
+#: Image search only runs when the message talks about images. The
+#: classifier sees one message with no context and kept reading ordinary
+#: chat as a search request, posting a Google result nobody asked for.
+IMAGE_TOPIC = (r"\b(?:images?|imgs?|pics?|pix|pictures?|photos?|"
+               r"photographs?|wallpapers?|gifs?)\b")
+#: "Next image" needs the same, or a bare follow-up and nothing else:
+#: "another one" mid-conversation must not answer "you haven't searched".
+NEXT_IMAGE_TOPIC = (IMAGE_TOPIC + rf"|^\W*(?:{re.escape(NAME.lower())}\W+)?"
+                    r"(?:(?:show me|give me|send)\s+)?"
+                    r"(?:another|the next|next|one more)(?:\s+one)?"
+                    rf"(?:\W+(?:please|pls|{re.escape(NAME.lower())}))?\W*$")
+
 #: (channel, user) -> (query, results, index). Pagination without
 #: components: the follow-up is a command, same as "leaderboard page 2".
 #: Memory only -- a stale result set is not worth persisting.
@@ -218,10 +233,27 @@ async def _fetch_images(query: str):
     risk=Risk.SAFE,
     guild_only=False,
     aliases=("image", "img"),
+    topic=IMAGE_TOPIC,
     params=(Param("query", "what to look for", max_length=200),),
     examples=("find a picture of a raven", "image search northern lights"),
 )
 async def image_search(ctx: CommandContext, query: str):
+    from ..core.scheduled import ANIMALS, animal_for_query, animal_post
+
+    # A plain request for a tinyfox animal ("a fox", "cute capybaras")
+    # gets the hourly-animal post instead (owner's rule). Anything more
+    # specific, or tinyfox being down, is a normal image search.
+    animal = animal_for_query(query)
+    if animal:
+        post = await animal_post(animal, f"Here is your {ANIMALS[animal]}.")
+        if post is not None:
+            # items=None marks an animal search; next_image fetches
+            # another picture of the same animal.
+            _IMAGE_RESULTS[(ctx.channel.id, ctx.invoker.id)] = (
+                query, None, animal)
+            post.embed.description = "Say \u201cnext image\u201d for another."
+            return post
+
     items, error = await _fetch_images(query)
     if error:
         return error
@@ -241,6 +273,7 @@ async def image_search(ctx: CommandContext, query: str):
     risk=Risk.SAFE,
     guild_only=False,
     aliases=("another_image", "next_picture", "another_one"),
+    topic=NEXT_IMAGE_TOPIC,
     examples=("next image", "show me another one", "next picture"),
 )
 async def next_image(ctx: CommandContext):
@@ -250,6 +283,12 @@ async def next_image(ctx: CommandContext):
         return ("You haven't searched for an image here yet. Try "
                 "\u201cimage search northern lights\u201d.")
     query, items, index = stored
+    if items is None:
+        # The last search was a tinyfox animal: index holds its key.
+        from ..core.scheduled import ANIMALS, animal_post
+
+        post = await animal_post(index, f"Here is your {ANIMALS[index]}.")
+        return post or "tinyfox isn't answering right now. Try again soon."
     if len(items) < 2:
         return "That search only turned up the one result."
 
@@ -306,10 +345,13 @@ async def leave(ctx: CommandContext) -> str:
 
 @command(
     name="echo",
-    description=(f"Owner only: post a message exactly as written, as {NAME}, "
-                 "in any channel"),
+    description=(f"Post a message exactly as written, as {NAME}, in a "
+                 "channel of this server"),
     risk=Risk.WRITE,
-    owner_only=True,
+    # Staff of THIS server, and only into this server's channels: posting
+    # as the bot is the server's call, not the bot owner's, so nobody
+    # (the bot owner included) can post into a server they don't run.
+    permission=Perm.MANAGE_GUILD,
     aliases=("say", "announce_as_corbin"),
     params=(
         Param("channel", "where to post: a #channel, its name, or its id",
@@ -319,7 +361,7 @@ async def leave(ctx: CommandContext) -> str:
     confirm_phrase=lambda a: f"post that in <#{a.get('channel')}>",
     examples=('echo "Server maintenance tonight at 9" in #announcements',
               "say hello everyone in #general",
-              "post this in 123456789012345678: welcome aboard"),
+              "post welcome aboard in #general"),
 )
 async def echo(ctx: CommandContext, channel: str, message: str) -> str:
     adapter = ctx.extras["adapter"]
@@ -329,6 +371,9 @@ async def echo(ctx: CommandContext, channel: str, message: str) -> str:
         if not found:
             return f"I can't find a channel called “{channel}”."
         target = found
+    owner = await adapter.resolve_guild_id(target)
+    if not ctx.guild_id or str(owner or "") != str(ctx.guild_id):
+        return "I can only post in this server's own channels."
     text = verbatim(message, ctx.extras.get("raw_text"))
     # "\n" typed literally becomes a line break, as on Discord.
     text = text.replace("\\n", "\n")
@@ -346,76 +391,121 @@ async def echo(ctx: CommandContext, channel: str, message: str) -> str:
 
 @command(
     name="messager",
-    description="DM everyone with a given role",
+    # Opt-in only: DMing everyone who merely holds a role is unsolicited.
+    # The role must be an opt-in DM role on the reaction roles
+    # (reaction_roles_dm), and only members who reacted for it are sent
+    # anything (core/reaction_roles.py, "Opt-in DM roles").
+    description="DM the members who opted in to an opt-in DM role "
+                "(set up on the reaction roles)",
     risk=Risk.DESTRUCTIVE,
     permission=Perm.MANAGE_GUILD,
     params=(
-        Param("role", "which role", kind="role"),
+        Param("role", "which opt-in DM role", kind="role"),
         Param("message", "what to send", max_length=1500),
     ),
     # Blast radius is unknown until we count the role, so always confirm.
     blast_radius=lambda a: 50,
-    confirm_phrase=lambda a: f"DM everyone with that role",
-    examples=("DM everyone with the Roleplayers role about the event",),
+    confirm_phrase=lambda a: "DM everyone who opted in to that role",
+    examples=("DM everyone who opted in to Announcements about the event",),
 )
 async def messager(ctx: CommandContext, role: str, message: str) -> str:
+    from .reaction_role_cmds import _store, role_holders
+
     adapter = ctx.extras["adapter"]
     if not str(role).isdigit():
         return f"There's no role called “{role}” here."
+    store = _store(ctx.extras)
+    mark = store.dm_roles(ctx.guild_id).get(str(role))
+    if mark is None:
+        return (f"I only DM people who asked for it, and <@&{role}> isn't "
+                "an opt-in DM role. Add one to the reaction roles (\"add "
+                "📬 Announcements to the reaction roles as an opt-in DM "
+                "role\"); whoever reacts for it gets these messages.")
 
-    http = getattr(adapter.client, "_http", None)
-    if http is None:
-        return "I can't reach the API right now."
-    try:
-        members = await http.request(http._route(
-            "GET", "/guilds/{guild_id}/members?limit=1000",
-            guild_id=ctx.guild_id))
-    except Exception as exc:
-        return f"I couldn't list members: {type(exc).__name__}"
-
-    targets = [m for m in (members or [])
-               if str(role) in [str(r) for r in (m.get("roles") or [])]]
+    holders = await role_holders(adapter, ctx.guild_id, str(role))
+    if holders is None:
+        return "I couldn't read the member list, so I sent nothing."
+    consented = store.consented(ctx.guild_id, str(role))
+    targets = [u for u in holders if u in consented]
+    # Holding it without having reacted means someone else gave it to
+    # them (or it happened while I was offline). Take it back.
+    strays = [u for u in holders if u not in consented]
+    for uid in strays:
+        try:
+            await adapter.remove_role(ctx.guild_id, uid, str(role))
+            logger.info("messager: took opt-in role %s off %s in %s "
+                        "(no reaction of theirs)", role, uid, ctx.guild_id)
+        except Exception as exc:
+            logger.warning("messager: couldn't take opt-in role %s off %s "
+                           "in %s: %s", role, uid, ctx.guild_id, exc)
     if not targets:
-        return "Nobody has that role."
+        return "Nobody has opted in to that role yet, so I sent nothing."
 
+    server = ctx.guild.name if ctx.guild else "the server"
+    footer = (f"\n\n-# You're getting this because you reacted "
+              f"{mark.get('emoji') or ''} for this in <#{mark['channel_id']}>"
+              f" on {server}. Take that reaction off to stop.")
     sent = failed = 0
-    for member in targets:
-        uid = str((member.get("user") or {}).get("id") or "")
-        if not uid:
-            continue
+    for uid in targets:
         try:
             ok = await adapter.send_dm(uid, Response(
-                content=f"**From {ctx.guild.name if ctx.guild else 'the server'}:**\n{message}"))
+                content=f"**From {server}:**\n{message}{footer}"))
             sent += bool(ok)
             failed += not ok
         except Exception:
             failed += 1
     tail = f" {failed} couldn't be reached." if failed else ""
-    return f"Sent to {sent} of {len(targets)} people.{tail}"
+    if strays:
+        tail += (f" {len(strays)} had the role without opting in; I took "
+                 "it off them and sent them nothing.")
+    return f"Sent to {sent} of {len(targets)} people who opted in.{tail}"
 
 
 @command(
-    name="verify",
-    # "Verify" also reads as "prove who I am", which is the claim
-    # command. Say what this one is for so the two stop competing.
-    description=f"Owner only: grant a guild or user unlimited {NAME} "
-                "access. Nothing to do with proving someone's identity "
-                "or with Discord accounts",
-    risk=Risk.WRITE,
+    name="servers",
+    description=f"Owner only: list the servers {NAME} is in, sent by DM",
+    risk=Risk.SAFE,
     owner_only=True,
-    params=(
-        Param("target", "a user or guild id"),
-        Param("enabled", "on or off", kind="boolean", required=False,
-              default=True),
-    ),
-    confirm_phrase=lambda a: f"verify {a.get('target')}",
-    examples=("verify this server", "verify user 12345"),
+    guild_only=False,
+    aliases=("list_servers", "my_servers", "server_list"),
+    examples=("what servers are you in?", "list your servers",
+              "how many servers are you in?"),
 )
-async def verify(ctx: CommandContext, target: str,
-                 enabled: bool = True) -> str:
-    settings = ctx.extras["settings"]
-    key = str(target).strip()
-    if key.lower() in ("this server", "here") and ctx.guild_id:
-        key = ctx.guild_id
-    settings.set_verified(key, enabled)
-    return f"{'Verified' if enabled else 'Unverified'} `{key}`."
+async def servers(ctx: CommandContext) -> Any:
+    """Name, id and member count for each, plus which have the premium
+    features (the owner's voice/streaming allowlist) on. Always a DM:
+    asked in a server, it isn't posted there (``private``)."""
+    adapter = ctx.extras.get("adapter")
+    if adapter is None or not hasattr(adapter, "guild_list"):
+        return "I can't reach the server list from here."
+    # Asked in a server: DM it rather than post it there. Asked in a DM:
+    # a plain reply ("private" there would DM the DM and then announce
+    # "sent to your DMs" in it).
+    private = ctx.guild_id is not None
+    try:
+        rows = await adapter.guild_list()
+    except Exception as exc:
+        return Response(content=f"I couldn't list my servers: {exc}",
+                        private=private)
+    allow = ctx.extras.get("features")
+    lines = []
+    for row in rows:
+        on = allow.enabled(row["id"]) if allow is not None else frozenset()
+        marks = " ".join(m for f, m in (("voice", "🎙️"),
+                                        ("streaming", "📺")) if f in on)
+        members = row.get("members")
+        count = f"{members:,} members" if isinstance(members, int) \
+            else "members unknown"
+        lines.append(f"**{row['name']}** · `{row['id']}` · {count}"
+                     + (f" · {marks}" if marks else ""))
+    total = sum(r["members"] for r in rows
+                if isinstance(r.get("members"), int))
+    embed = Embed(title=f"I'm in {len(rows)} server"
+                        f"{'s' if len(rows) != 1 else ''}",
+                  description=(f"{total:,} members between them."
+                               if rows else "None at all."))
+    if rows:
+        embed.add_list_field("Servers", lines)
+        embed.footer = "🎙️ voice chat on · 📺 streaming on"
+    return Response(embed=embed, private=private,
+                    private_notice="Sent my server list to your DMs.")

@@ -64,12 +64,25 @@ class LLM:
     async def call(self, *, model: str, messages: list[dict],
                    system: Optional[str] = None, max_tokens: int = 4096,
                    temperature: Optional[float] = None,
-                   tools: Optional[list] = None) -> Any:
+                   tools: Optional[list] = None,
+                   structured: bool = False) -> Any:
         """One completion. Retries once on failure, then raises.
 
         ``tools`` are OpenAI function schemas. A model that doesn't support
         them usually just ignores them and answers.
+
+        ``structured``: a JSON or one-word task (classifier, extraction,
+        presence gate). Runs at temperature 0 unless the call sets one,
+        with no presence penalty: the penalty is there to stop rambling
+        replies, and on JSON it taxes every repeated quote, brace and key.
         """
+        extra: dict[str, Any] = {}
+        if tools:
+            extra["tools"] = tools
+        if structured:
+            extra["presence_penalty"] = 0
+            if temperature is None:
+                temperature = 0.0
         provider = self._provider(model)
         started = time.monotonic()
         last_error: Optional[BaseException] = None
@@ -77,8 +90,7 @@ class LLM:
             try:
                 result = await provider.call(
                     messages=messages, system=system, max_tokens=max_tokens,
-                    temperature=temperature,
-                    **({"tools": tools} if tools else {}))
+                    temperature=temperature, **extra)
                 logger.info(
                     "AI call success (model=%s, attempt=%d, latency=%.2fs, "
                     "in=%s, out=%s, reasoning=%s%s)",
@@ -110,7 +122,7 @@ class LLM:
             result = await self.call(
                 model=fast, system=system,
                 messages=[{"role": "user", "content": user}],
-                max_tokens=max_tokens)
+                max_tokens=max_tokens, structured=True)
             return result.text or ""
 
         return _call

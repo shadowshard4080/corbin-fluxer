@@ -27,6 +27,8 @@ from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from ..core.logtext import said
+
 logger = logging.getLogger("corbin.ollama")
 
 #: How long a health verdict is trusted.
@@ -167,8 +169,8 @@ def parse_tool_calls(raw: Any) -> list:
             try:
                 args = json.loads(args) if args.strip() else {}
             except ValueError:
-                logger.warning("tool call %s had unparseable arguments: %r",
-                               name, args[:200])
+                logger.warning("tool call %s had unparseable arguments: %s",
+                               name, said(args, 200))
                 args = {}
         calls.append({"name": name,
                       "arguments": args if isinstance(args, dict) else {}})
@@ -306,7 +308,10 @@ class OllamaProvider:
                    system: Optional[str] = None,
                    max_tokens: int = 2048,
                    temperature: Optional[float] = None,
-                   tools: Optional[list] = None) -> OllamaResult:
+                   tools: Optional[list] = None,
+                   presence_penalty: Optional[float] = None) -> OllamaResult:
+        """``presence_penalty`` overrides the provider's for this call;
+        0 sends none (structured output, where it does harm)."""
         import httpx
 
         payload: dict[str, Any] = {
@@ -320,8 +325,10 @@ class OllamaProvider:
                           else self.temperature)
         if effective_temp is not None:
             payload["temperature"] = effective_temp
-        if self.presence_penalty:
-            payload["presence_penalty"] = self.presence_penalty
+        penalty = (presence_penalty if presence_penalty is not None
+                   else self.presence_penalty)
+        if penalty:
+            payload["presence_penalty"] = penalty
         if tools:
             payload["tools"] = tools
 
@@ -355,14 +362,15 @@ class OllamaProvider:
                    if finish == "length" and used >= ctx - 16 else "")
             logger.warning(
                 "ollama produced only reasoning (%d chars, finish=%s, "
-                "raw content=%r); treating as empty%s | reasoning ends: %r",
-                len(reasoning), finish or "?", raw_content[:80], why,
-                reasoning[-160:].replace("\n", " "))
+                "raw content=%s); treating as empty%s | reasoning ends: %s",
+                len(reasoning), finish or "?", said(raw_content), why,
+                said(reasoning[-160:].replace("\n", " "), 160))
 
         loop = degenerate_reason(text)
         if loop:
             logger.warning("ollama reply discarded as a repetition loop (%s, "
-                           "finish=%s): %r", loop, finish or "?", text[:160])
+                           "finish=%s): %s", loop, finish or "?",
+                           said(text, 160))
             text = ""
 
         tool_calls = parse_tool_calls(message.get("tool_calls"))

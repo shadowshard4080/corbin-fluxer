@@ -30,6 +30,12 @@ class Executor:
         self.platform = platform
         #: Extra services handlers can reach via ``ctx.extras`` (settings, …).
         self.extras: dict[str, Any] = {}
+        #: ``hook(spec, ctx)`` after a command ran without failing: the
+        #: daily digest's "Commands run". Never counted anywhere before
+        #: (the Discord build counted slash commands through an event
+        #: Fluxer doesn't have), so the digest always said 0.
+        self.on_command: Optional[Callable[[CommandSpec, CommandContext],
+                                           Any]] = None
 
     async def run(
         self,
@@ -121,6 +127,12 @@ class Executor:
             # replying "done" is the exact bug the parent repo fixed in /warn.
             logger.exception("command %s failed", spec.name)
             return f"That failed: {type(exc).__name__}: {exc}"
+
+        if self.on_command is not None:
+            try:
+                self.on_command(spec, ctx)
+            except Exception:
+                logger.debug("command hook failed", exc_info=True)
 
         if spec.risk is Risk.DESTRUCTIVE:
             self._register_undo(spec, ctx, args)

@@ -131,7 +131,7 @@ def suite_channel(r: Results) -> None:
 
 class _LLM:
     class constants:
-        MODEL_FAST = "fast"; MODEL_MAIN = "main"
+        MODEL_FAST = "fast"; MODEL_MAIN = MODEL_REPLY = MODEL_THINK = "main"
         EFFORT_FAST = "none"; EFFORT_MAIN = "low"; EFFORT_PRESENCE = "low"
 
     def __init__(self, text):
@@ -155,6 +155,14 @@ class _Memory:
 
     def get_server(self, gid):
         return type("S", (), {"facts": self.facts})()
+
+
+class _Search:
+    def __init__(self, text): self.text, self.queries = text, []
+
+    async def run(self, q):
+        self.queries.append(q)
+        return {"text": self.text, "sources": []}
 
 
 class _Always(random.Random):

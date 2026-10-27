@@ -179,23 +179,23 @@ def suite_name_resolution(r: Results) -> None:
     """A user param may arrive as a name, a mention or an id."""
     a = FluxerAdapter(type("C", (), {"_http": object()})())
     a.member_name_index = lambda g: asyncio.sleep(0, result={
-        "alex": "U1", "alex#5928": "U1", "sam": "U2"})
+        "juniper": "U1", "juniper#5928": "U1", "pip": "U2"})
     a.role_name_index = lambda g: asyncio.sleep(0, result={"artist": "R2"})
 
     def resolve(value, kind="user"):
         return asyncio.run(a.resolve_named("G", kind, value))
 
-    r.check("a bare username resolves", resolve("alex"), "U1")
+    r.check("a bare username resolves", resolve("juniper"), "U1")
     # This is what actually failed: the @ made it a name nobody indexed,
     # and it went into the URL as though it were an id.
-    r.check("an @-prefixed username resolves", resolve("@alex"), "U1")
-    r.check("name#discriminator resolves", resolve("@alex#5928"), "U1")
+    r.check("an @-prefixed username resolves", resolve("@juniper"), "U1")
+    r.check("name#discriminator resolves", resolve("@juniper#5928"), "U1")
     r.check("a stale discriminator falls back to the username",
-            resolve("alex#0000"), "U1")
+            resolve("juniper#0000"), "U1")
     r.check("a mention token yields its id", resolve("<@1234>"), "1234")
     r.check("a nickname mention too", resolve("<@!1234>"), "1234")
-    r.check("an id passes through", resolve("222222222222222222"),
-            "222222222222222222")
+    r.check("an id passes through", resolve("444444444444444444"),
+            "444444444444444444")
     r.check("an unknown name is returned unchanged, not guessed",
             resolve("nobody"), "nobody")
     r.check("roles still resolve", resolve("the Artist", "role"),
@@ -254,7 +254,7 @@ def suite_swapped_args(r: Results) -> None:
                                      Member, Platform, Role, Surface, User)
     import corbin.commands.moderation as mod
 
-    ROLE, USER = "333333333333333333", "222222222222222222"
+    ROLE, USER = "333333333333333333", "444444444444444444"
     roles = {ROLE: Role(id=ROLE, name="awoo", position=3, permissions=0)}
     done = []
 

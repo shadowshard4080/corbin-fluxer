@@ -11,12 +11,12 @@ import os
 
 from typing import Any, Optional
 
-from ..identity import NAME
 from ..core.context import CommandContext, Embed
 from ..core.permissions import Perm
-from ..core.ranking import (ROLE_TIERS, next_role,
-                            role_for_level, xp_for_level)
+from ..core.ranking import (MAX_TIER_LEVEL, RankRoles, next_role,
+                            xp_for_level)
 from ..core.registry import Param, Risk, command
+from ..identity import NAME
 
 PAGE_SIZE = 10
 
@@ -56,7 +56,8 @@ def average_colour(image_bytes: Optional[bytes]) -> Optional[int]:
 def level_up_embed(name: str, entry: Any, *,
                    avatar_url: Optional[str] = None,
                    colour: Optional[int] = None,
-                   new_title: bool = False) -> Embed:
+                   new_title: bool = False,
+                   title: Optional[str] = None) -> Embed:
     """The rank-up card, field for field with the Discord build."""
     embed = Embed(title=f"🏆 {name} has ranked up.",
                   description="Congratulations on your achievement!",
@@ -64,7 +65,9 @@ def level_up_embed(name: str, entry: Any, *,
                   thumbnail_url=avatar_url or None,
                   image_url=LEVEL_UP_GIF)
     embed.add_field("Level:", str(entry.level))
-    role = entry.role_name or "None yet"
+    # ``title``: the server's own tier name (RankRoles); the default
+    # tiers' name only for a caller that doesn't pass one.
+    role = (title if title is not None else entry.role_name) or "None yet"
     embed.add_field("New role:" if new_title else "Current role:", role)
     embed.add_field("Total XP:", f"{entry.chat_xp:,}")
     embed.add_field("Total messages sent:", f"{entry.total_messages:,}")
@@ -83,6 +86,10 @@ def _resolve_channel(ctx: CommandContext, value: Optional[str]) -> Optional[str]
         return text
     index = ctx.extras.get("channel_index") or {}
     return index.get(text.lower())
+
+
+def _rank_roles(ctx: CommandContext) -> RankRoles:
+    return ctx.extras.get("rank_roles") or RankRoles(ctx.extras["settings"])
 
 
 def _medal(position: int) -> str:
@@ -114,7 +121,10 @@ async def rank(ctx: CommandContext, user: Optional[str] = None) -> Any:
 
     position = ranking.position(ctx.guild_id, target)
     into, span = entry.progress
-    upcoming = next_role(entry.level)
+    roles = _rank_roles(ctx)
+    tiers = roles.tiers(ctx.guild_id)
+    upcoming = next_role(entry.level, tiers)
+    title = roles.role_for(ctx.guild_id, entry.level)
 
     name = (ctx.invoker.display_name if target == ctx.invoker.id
             else f"<@{target}>")
@@ -123,8 +133,8 @@ async def rank(ctx: CommandContext, user: Optional[str] = None) -> Any:
                     inline=True)
     embed.add_field("XP", f"{entry.chat_xp:,}", inline=True)
     embed.add_field("Messages", f"{entry.total_messages:,}", inline=True)
-    if entry.role_name:
-        embed.add_field("Title", entry.role_name, inline=True)
+    if title:
+        embed.add_field("Title", title, inline=True)
     embed.add_field(
         f"Progress to level {entry.level + 1}",
         f"`{entry.bar()}`  {into:,} / {span:,} XP",
@@ -156,21 +166,23 @@ async def sync_ranks(ctx: CommandContext) -> str:
     if ranking is None or ctx.guild_id is None:
         return "Ranking only works inside a server."
 
-    created, problems = await adapter.ensure_rank_roles(ctx.guild_id,
-                                                        ROLE_TIERS)
+    roles = _rank_roles(ctx)
+    created, problems = await adapter.ensure_rank_roles(
+        ctx.guild_id, roles.tiers(ctx.guild_id))
     if problems:
         return (f"I couldn't set the roles up: {problems[0]}. I need Manage "
                 "Roles, and my role has to be above the ones I create.")
 
-    names = [n for n, _c in ROLE_TIERS.values()]
+    # Retired names too, so a renamed or removed tier comes off everyone.
+    names = roles.all_names(ctx.guild_id)
     rows, total = ranking.leaderboard(ctx.guild_id, limit=200)
     applied, failed = 0, 0
     for entry in rows:
-        role = role_for_level(entry.level)
+        role = roles.role_for(ctx.guild_id, entry.level)
         if not role:
             continue
         err = await adapter.apply_rank_role(ctx.guild_id, entry.user_id,
-                                            role[0], names)
+                                            role, names)
         if err:
             failed += 1
         else:
@@ -209,9 +221,11 @@ async def leaderboard(ctx: CommandContext, page: int = 1) -> Any:
             return f"That's past the end. There are only {total} ranked members."
         return "Nobody has any XP here yet."
 
+    roles = _rank_roles(ctx)
     lines = []
     for index, entry in enumerate(rows, start=offset + 1):
-        title = f" · {entry.role_name}" if entry.role_name else ""
+        name = roles.role_for(ctx.guild_id, entry.level)
+        title = f" · {name}" if name else ""
         lines.append(f"{_medal(index)} <@{entry.user_id}> — level "
                      f"**{entry.level}** ({entry.chat_xp:,} XP){title}")
 
@@ -265,12 +279,152 @@ async def setup_ranking(ctx: CommandContext, enabled: bool,
     settings.set_ranking_channel(ctx.guild_id, target)
 
     adapter = ctx.extras["adapter"]
-    created, problems = await adapter.ensure_rank_roles(ctx.guild_id,
-                                                        ROLE_TIERS)
+    tiers = _rank_roles(ctx).tiers(ctx.guild_id)
+    created, problems = await adapter.ensure_rank_roles(ctx.guild_id, tiers)
     note = f" {len(created)} rank roles are ready."
     if problems:
-        note = (f" I could only set up {len(created)} of {len(ROLE_TIERS)} "
+        note = (f" I could only set up {len(created)} of {len(tiers)} "
                 f"rank roles: {problems[0]}. I probably need Manage Roles, "
                 "and my own role has to sit above the ones I create.")
     return (f"Ranking is on. I'll count XP from messages and post level-ups "
             f"in <#{target}>.{note} Level 1 starts at 100 XP.")
+
+
+# -- customising the rank roles ----------------------------------------------
+
+def _colour(text: Optional[str]) -> Optional[int]:
+    """"#ffaa00", "ffaa00", "0xffaa00" -> int; None if not given.
+    Raises ValueError on something that isn't a hex colour."""
+    if text is None or not str(text).strip():
+        return None
+    raw = str(text).strip().lower().removeprefix("#").removeprefix("0x")
+    if len(raw) != 6 or any(c not in "0123456789abcdef" for c in raw):
+        raise ValueError(f"“{text}” isn't a colour I can read; use a hex "
+                         "code like #ffaa00")
+    return int(raw, 16)
+
+
+async def _role_name(ctx: CommandContext, role: str) -> str:
+    """A role mention or id becomes that role's name, so linking an
+    existing role ("make @Pup the level 5 role") adopts it by name."""
+    text = str(role or "").strip()
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if digits and (text.startswith("<@&") or text.isdigit()):
+        adapter = ctx.extras.get("adapter")
+        try:
+            index = await adapter.role_index(ctx.guild_id) if adapter else {}
+        except Exception:
+            index = {}
+        found = index.get(digits)
+        if found is not None and getattr(found, "name", None):
+            return found.name
+    return text.lstrip("@")
+
+
+def _tier_list(tiers: dict) -> str:
+    return "\n".join(f"• Level **{lvl}**: {name} (`#{colour:06x}`)"
+                      for lvl, (name, colour) in sorted(tiers.items())) \
+        or "None: nobody gets a rank role here."
+
+
+@command(
+    name="rank_roles",
+    description="List this server's rank roles and the level each one "
+                "is earned at",
+    risk=Risk.SAFE,
+    aliases=("list_rank_roles", "rank_titles", "level_roles"),
+    topic=r"rank|level|role|title",
+    examples=("what are the rank roles?", "which roles do levels give?"),
+)
+async def rank_roles(ctx: CommandContext) -> Any:
+    roles = _rank_roles(ctx)
+    tiers = roles.tiers(ctx.guild_id)
+    return Embed(
+        title="Rank roles",
+        description=_tier_list(tiers),
+        footer=("Customised for this server" if roles.custom(ctx.guild_id)
+                else "The default set. Admins can change them: "
+                     "“make level 10 give the role Pup”"))
+
+
+@command(
+    name="rank_role_set",
+    description="Add or change a rank role: the role a level earns, its "
+                "name and colour. Naming an existing role uses that role",
+    risk=Risk.WRITE,
+    permission=Perm.MANAGE_GUILD,
+    aliases=("set_rank_role", "rename_rank_role", "add_rank_role"),
+    params=(
+        Param("level", "the level that earns it", kind="integer",
+              min_value=1, max_value=MAX_TIER_LEVEL),
+        Param("role", "the role's name, or @ an existing role"),
+        Param("colour", "a hex colour like #ffaa00", required=False),
+    ),
+    topic=r"rank|level|role|title",
+    confirm_phrase=lambda a: (f"make level {a.get('level')} give the role "
+                              f"{a.get('role')}"),
+    examples=("make level 10 give the role Pup",
+              "rename the level 25 rank role to Moon Child",
+              "set the level 50 rank role to @Elder with colour #c0c0c0"),
+)
+async def rank_role_set(ctx: CommandContext, level: int, role: str,
+                        colour: Optional[str] = None) -> str:
+    roles = _rank_roles(ctx)
+    try:
+        name = await _role_name(ctx, role)
+        replaced = roles.set(ctx.guild_id, level, name, _colour(colour))
+    except ValueError as exc:
+        return f"That won't work: {exc}."
+    adapter = ctx.extras.get("adapter")
+    note = ""
+    if adapter is not None:
+        tier = {level: roles.tiers(ctx.guild_id)[level]}
+        _made, problems = await adapter.ensure_rank_roles(ctx.guild_id, tier)
+        if problems:
+            note = (f" I couldn't create the role yet ({problems[0]}): I "
+                    "need Manage Roles, and my role above it.")
+    was = f", replacing **{replaced}**" if replaced else ""
+    return (f"Level {level} now earns **{name}**{was}.{note} Say “sync the "
+            "rank roles” to update everyone who's already past it.")
+
+
+@command(
+    name="rank_role_remove",
+    description="Stop a level from giving a rank role",
+    risk=Risk.WRITE,
+    permission=Perm.MANAGE_GUILD,
+    aliases=("remove_rank_role", "delete_rank_role"),
+    params=(Param("level", "the level whose role to drop", kind="integer",
+                  min_value=1, max_value=MAX_TIER_LEVEL),),
+    topic=r"rank|level|role|title",
+    confirm_phrase=lambda a: f"remove the level {a.get('level')} rank role",
+    examples=("remove the level 500 rank role",
+              "stop level 175 giving a role"),
+)
+async def rank_role_remove(ctx: CommandContext, level: int) -> str:
+    name = _rank_roles(ctx).remove(ctx.guild_id, level)
+    if name is None:
+        return f"No rank role is set for level {level}."
+    return (f"Level {level} no longer gives **{name}**. The role itself "
+            "is still in the server; say “sync the rank roles” to take it "
+            "off members, or delete it in the server settings.")
+
+
+@command(
+    name="rank_roles_reset",
+    description="Put this server's rank roles back to the defaults",
+    risk=Risk.WRITE,
+    permission=Perm.MANAGE_GUILD,
+    always_confirm=True,
+    aliases=("reset_rank_roles",),
+    topic=r"rank|level|role|title",
+    confirm_phrase=lambda a: "put the rank roles back to the defaults",
+    examples=("reset the rank roles to default",),
+)
+async def rank_roles_reset(ctx: CommandContext) -> str:
+    roles = _rank_roles(ctx)
+    if not roles.custom(ctx.guild_id):
+        return "They're already the defaults."
+    roles.reset(ctx.guild_id)
+    return ("Rank roles are back to the defaults. Say “sync the rank "
+            "roles” to swap everyone over.")

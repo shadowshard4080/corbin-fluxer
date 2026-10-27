@@ -252,26 +252,23 @@ def suite_risk(r: Results) -> None:
                     target=TargetProfile("hi", "Boss", top_role_position=99)).decision,
             Decision.REFUSED)
 
-    # --- bot owner bypasses permissions and hierarchy, but not policy -----
-    # Mirrors the Discord build's `administrator or user.id == OWNER`.
-    r.check("bot owner bypasses a missing permission",
+    # --- the bot owner gets NO bypass in someone else's server -----------
+    r.check("the bot owner without the permission is denied",
             verdict(ban, {"user": "t-new", "reason": "spam"}, invoker=peon,
                     conf=1.0, target=NEWBIE, owner=True).decision,
-            Decision.EXECUTE)
+            Decision.DENIED)
     r.check("non-owner without permission is still denied",
             verdict(ban, {"user": "t-new"}, invoker=peon, conf=1.0,
                     target=NEWBIE).decision, Decision.DENIED)
-    r.check("bot owner bypass applies on explicit surfaces too",
+    r.check("...on explicit surfaces too",
             verdict(ban, {"user": "t-new"}, invoker=peon, conf=1.0,
                     target=NEWBIE, owner=True,
-                    surface=Surface.SLASH).decision, Decision.EXECUTE)
-
-    # --- bot owner bypasses hierarchy but not policy ----------------------
-    r.check("bot owner bypasses hierarchy",
+                    surface=Surface.SLASH).decision, Decision.DENIED)
+    r.check("the bot owner is held to the role hierarchy",
             verdict(ban, {"user": "hi", "reason": "raiding"}, conf=1.0,
                     owner=True,
                     target=TargetProfile("hi", "Boss", top_role_position=99)).decision,
-            Decision.EXECUTE)
+            Decision.REFUSED)
     r.check("bot owner still cannot ban a bot",
             verdict(ban, {"user": "b"}, conf=1.0, owner=True,
                     target=TargetProfile("b", "Bot", is_bot=True)).decision,
@@ -365,7 +362,7 @@ def suite_confirm(r: Results) -> None:
         r.ok(f"negative: {text!r}", is_negative(text))
     r.ok("undo recognised", is_undo("undo"))
     r.ok("qualified yes is not a bare yes", not is_affirmative("yes but ban everyone"))
-    r.ok("sentence is not a yes", not is_affirmative("yes I was talking to Sam"))
+    r.ok("sentence is not a yes", not is_affirmative("yes I was talking to Lux"))
 
     s2 = PendingStore()
     s2.put(guild_id="g", channel_id="c", user_id="u", command="x", args={},
@@ -435,7 +432,7 @@ def suite_parsing(r: Results) -> None:
 def suite_gates(r: Results) -> None:
     reg = build_registry()
     for text in ("ban @steve", "what's the weather in Oslo",
-                 "clear 50 messages", "who is @sam", "give @sam a role"):
+                 "clear 50 messages", "who is @pip", "give @pip a role"):
         r.ok(f"request shape: {text!r}", looks_like_request(text, reg))
     for text in ("hey corbin", "lol", "", "  ", "mmm", "brb"):
         r.ok(f"no request shape: {text!r}", not looks_like_request(text, reg))
@@ -486,6 +483,18 @@ def suite_dispatch(r: Results) -> None:
     res = go(d, "good morning everyone")
     r.ok("chatter converses", res.converse)
     r.check("chatter never calls the model", len(d.classifier.calls), 0)
+
+    # A DM is always directly invoked, so ordinary chat reaches the
+    # classifier. A server-only command matched there must converse (with
+    # the command set aside), not reply "That only works in a server":
+    # a homework question about "takeaways" got that, twice.
+    d = dispatcher({"ban @Newbie": Intent("ban", {"user": "t-new"}, 0.99, True)})
+    res = asyncio.run(d.handle("ban @Newbie", invoker=mod, channel_id="dm",
+                               guild_id=None, directly_invoked=True))
+    r.ok("server-only match in a DM converses", res.converse and not res.handled)
+    r.check("...with the command set aside", res.decision,
+            Decision.NOT_A_COMMAND)
+    r.ok("...and no refusal text", "only works" not in res.message)
 
     # the three scenarios, end to end
     d = dispatcher({"ban @Newbie": Intent(
@@ -613,6 +622,44 @@ def suite_dispatch(r: Results) -> None:
     r.ok("undo leaks no sentinel", "__undo__" not in res.message)
     r.ok("undo message is human", "Reversing" in res.message)
 
+    # Banter falls through to conversation, but says which command it was
+    # about, so the reply can't deny having it ("I'm text-only").
+    d = Dispatcher(reg2, ScriptedClassifier(
+        {"lol ban @Veteran": Intent("ban", {"user": "t-vet"}, 0.95, False)}),
+        resolver=resolver)
+    res = asyncio.run(d.handle("lol ban @Veteran", invoker=mod,
+                               channel_id="c", guild_id="g",
+                               directly_invoked=True))
+    r.check("banter converses", (res.converse, res.decision),
+            (True, Decision.NOT_A_COMMAND))
+    r.ok("...naming the command it was about",
+         res.spec is not None and res.spec.name == "ban")
+
+
+def suite_search_arg_types(r: Results) -> None:
+    """_assess_confidence takes a LIST; the other two take a KEY.
+
+    Passing a key to _assess_confidence iterates the string character by
+    character and raises TypeError inside the shared mixin.
+    """
+    import inspect
+    from pathlib import Path
+
+    src = Path(__file__).resolve().parent.parent / "corbin" / "ai" / \
+        "cloud" / "search.py"
+    if not src.exists():
+        r.ok("shared search module present (skipped)", True)
+        return
+    text = src.read_text(encoding="utf-8-sig")
+    r.ok("_assess_confidence still takes a history list",
+         "conversation_history: List[dict]" in text)
+    r.ok("_build_search_query still takes a key",
+         "_build_search_query(self, user_content: str, conversation_key: str)"
+         in text)
+    r.ok("_classify_query_mode still takes a key",
+         "_classify_query_mode(self, user_content: str, conversation_key: str)"
+         in text)
+
 
 def suite_choice_matching(r: Results) -> None:
     """A language model answers "voice activity", not ``voice``.
@@ -653,9 +700,74 @@ def suite_choice_matching(r: Results) -> None:
         r.ok("error lists readable options", "message edit" in str(exc))
 
 
+def suite_topic_gate(r: Results) -> None:
+    """A command whose subject is one noun only runs when it's mentioned.
+
+    The classifier sees one message with no context: "will that be a full
+    pot?" (an Instant Pot) ran the moon calendar, and "this is the entire
+    log (again), can you look for it?" (a pasted game log) the audit
+    status. Both were confident, so only a check on the text stops them.
+    """
+    import corbin.commands.audit_cmds  # noqa: F401
+    import corbin.commands.moon_cmds  # noqa: F401
+    import corbin.commands.tv_cmds  # noqa: F401
+    from corbin.ai.command_help import CommandHelp
+    from corbin.core.registry import registry
+
+    gated = [s for s in registry.ai_invocable() if s.topic]
+    r.ok("moon and audit commands are gated",
+         {"moon", "moon-calendar", "setup-fullmoon", "audit-logs",
+          "audit-category", "audit-status"} <= {s.name for s in gated})
+    for spec in gated:
+        for ex in spec.examples:
+            r.ok(f"{spec.name} example on topic: {ex!r}", spec.on_topic(ex))
+    for name, text in (("moon-calendar", "Will that be a full pot?"),
+                       ("moon", "I want a full pot of chili"),
+                       ("audit-status", "this is the entire log (again), "
+                                        "can you look for it?"),
+                       ("audit-status", "check the crash log for me")):
+        r.ok(f"{name} off topic: {text!r}",
+             not registry.get(name).on_topic(text))
+    r.ok("ungated commands always pass",
+         registry.get("tv-channels").on_topic("anything"))
+
+    mod = member("mod", perms=Perm.MANAGE_GUILD, position=10)
+    pot = "Will that be a full pot?"
+    d = Dispatcher(registry, ScriptedClassifier(
+        {pot: Intent("moon-calendar", {}, 0.95, True)}))
+    res = asyncio.run(d.handle(pot, invoker=mod, channel_id="c",
+                               guild_id="g", directly_invoked=True))
+    r.check("off topic converses", (res.converse, res.handled),
+            (True, False))
+    r.ok("...and suggests the command it guessed",
+         res.suggest is not None and res.suggest.name == "moon-calendar")
+    r.ok("...without the set-aside note", res.decision is None)
+
+    help_ = CommandHelp(registry, bot_owner_id="999")
+    r.check("did you mean: the first example",
+            help_.did_you_mean(registry.get("audit-status"), mod,
+                               in_guild=True),
+            '-# Did you mean: "Show me the server logs"?')
+    nobody = member("nobody")
+    r.check("no suggestion for a command they can't run",
+            help_.did_you_mean(registry.get("audit-logs"), nobody,
+                               in_guild=True), None)
+
+    # A SAFE command the classifier isn't sure of: answer, then suggest,
+    # rather than "Want me to show the moon calendar? (yes/no)".
+    unsure = "moon stuff"
+    d = Dispatcher(registry, ScriptedClassifier(
+        {unsure: Intent("moon-calendar", {}, 0.3, True)}))
+    res = asyncio.run(d.handle(unsure, invoker=mod, channel_id="c",
+                               guild_id="g", directly_invoked=True))
+    r.check("unsure SAFE command converses", res.converse, True)
+    r.ok("...suggesting it", res.suggest is not None)
+    r.ok("...with no pending yes/no", d.store.take("c", "mod") is None)
+
 SUITES = [
     ("permissions", suite_permissions),
     ("choice matching", suite_choice_matching),
+    ("shared search signatures", suite_search_arg_types),
     ("registry", suite_registry),
     ("risk policy", suite_risk),
     ("per-user grants", suite_grants),
@@ -663,6 +775,7 @@ SUITES = [
     ("json + intent parsing", suite_parsing),
     ("free gates", suite_gates),
     ("dispatcher end-to-end", suite_dispatch),
+    ("topic gate + did you mean", suite_topic_gate),
 ]
 
 if __name__ == "__main__":

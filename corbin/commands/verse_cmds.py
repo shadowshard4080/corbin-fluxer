@@ -7,11 +7,43 @@ from typing import Any, Optional
 from ..core import verses
 from ..core.context import CommandContext, Embed
 from ..core.permissions import Perm
+from ..core.reactions import Controls, legend
 from ..core.registry import Param, Risk, command
 
 TRANSLATION_CHOICES = ("kjv", "nasb", "hebrew", "greek", "original",
                        "commentary")
 COLOUR = 0x8B6F47
+
+#: Reaction controls on every verse embed: switch between these in place.
+#: Hebrew/Greek stay reachable by asking ("John 1:1 in greek").
+VERSE_BUTTONS = (("📜", "KJV"), ("📘", "NASB95"),
+                 ("📖", "John Gill's Exposition"))
+BUTTON_TRANSLATION = {"📜": "kjv", "📘": "nasb", "📖": "commentary"}
+_COMMENTARY_SUFFIX = " — commentary"
+
+
+def _with_controls(embed: Embed, ref: dict, translation: str,
+                   source: str = "") -> Embed:
+    """Add the translation switcher and say so in the footer."""
+    hint = "React to switch: " + legend(VERSE_BUTTONS)
+    embed.footer = f"{source}\n{hint}" if source else hint
+    embed.controls = Controls(kind="verse", buttons=VERSE_BUTTONS,
+                              state={"ref": dict(ref),
+                                     "translation": translation})
+    return embed
+
+
+def ref_from_title(title: str) -> dict | None:
+    """The reference a verse embed is about, read back from its title.
+
+    Lets the buttons on an embed posted before a restart still work: the
+    title is all the state they need.
+    """
+    title = (title or "").strip()
+    if title.endswith(_COMMENTARY_SUFFIX):
+        title = title[:-len(_COMMENTARY_SUFFIX)]
+    refs = verses.parse(title)
+    return refs[0] if refs else None
 
 
 #: Words that ask for something other than the default translation. The
@@ -49,36 +81,41 @@ def _slug(choice: Optional[str], book: int) -> str:
 
 async def build_verse_embed(ref: dict, *, translation: str = "kjv",
                             gill: Any = None) -> Embed:
-    """One embed for a reference. Used by both the command and detection."""
+    """One embed for a reference. Used by the command, detection, and the
+    reaction buttons, so all three look the same."""
     title = verses.ref_title(ref)
+    translation = (translation or "kjv").lower()
 
-    if (translation or "").lower() == "commentary":
+    if translation == "commentary":
         rows = gill.lookup(ref) if gill is not None and gill.available else []
         source = "John Gill's Exposition"
         if not rows:
             rows = await verses.fetch_net_notes(ref)
             source = "NET translators' notes"
         if not rows:
-            return Embed(title=title,
-                         description="No commentary available for that one.",
-                         colour=COLOUR)
+            return _with_controls(
+                Embed(title=title + _COMMENTARY_SUFFIX,
+                      description="No commentary available for that one.",
+                      colour=COLOUR), ref, translation)
         body = "\n\n".join(f"**{n}.** {t}" for n, t in rows)
-        embed = Embed(title=f"{title} — commentary", colour=COLOUR)
+        embed = Embed(title=title + _COMMENTARY_SUFFIX, colour=COLOUR)
         # Commentary runs long; the adapter clips, but split so nothing is
         # silently lost at the 4096 description limit.
         embed.add_list_field(source, body.split("\n\n"))
-        return embed
+        return _with_controls(embed, ref, translation, source)
 
     slug = _slug(translation, ref["book"])
     rows = await verses.fetch_passage(ref, slug)
     if not rows:
-        return Embed(title=title,
-                     description="Couldn't fetch that passage just now.",
-                     colour=COLOUR)
+        return _with_controls(
+            Embed(title=title,
+                  description="Couldn't fetch that passage just now.",
+                  colour=COLOUR), ref, translation)
     body = " ".join(f"**{n}** {t}" for n, t in rows) if len(rows) > 1 \
         else rows[0][1]
-    return Embed(title=title, description=body, colour=COLOUR,
-                 footer=verses.translations().get(slug, slug))
+    return _with_controls(Embed(title=title, description=body, colour=COLOUR),
+                          ref, translation,
+                          verses.translations().get(slug, slug))
 
 
 @command(
