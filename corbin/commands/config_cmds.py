@@ -351,39 +351,206 @@ async def general_channel(ctx: CommandContext, channel: str) -> str:
     examples=("what's your config", "show your settings"),
 )
 async def chat_status(ctx: CommandContext) -> Embed:
+    """Every per-server setting, configured or not (owner, 2026-11-17:
+    ranking, banners and the quote channel were missing). A setting
+    that's off says "off" or "not set" rather than leaving its field
+    out, so an absent line can never be read as "this server has none".
+    The adapter drops fields past ``EMBED_MAX_FIELDS``, and a test
+    holds a fully configured server under it."""
     settings = ctx.extras["settings"]
-    gid = ctx.guild_id
-    ai = sorted(settings.ai_channels(gid)) if gid else []
-    silenced = sorted(settings.silenced(gid)) if gid else []
-
+    gid = str(ctx.guild_id) if ctx.guild_id else None
     embed = Embed(title=f"{NAME} — configuration",
                   description=(ctx.guild.name if ctx.guild else "Direct messages"))
-    embed.add_field("Mode", settings.mode(gid), inline=True)
-    general = settings.general_channel(gid) if gid else None
-    embed.add_field("General chat", f"<#{general}>" if general else "not set",
-                    inline=True)
+    if not gid:
+        embed.add_field("Mode", settings.mode(None), inline=True)
+        return embed
+    for name, value, inline in status_fields(ctx, settings, gid):
+        embed.add_field(name, value, inline=inline)
+    return embed
+
+
+def _chan(cid: object, unset: str = "not set") -> str:
+    return f"<#{cid}>" if cid else unset
+
+
+def _channel_list(ids: list, cap: int = 10) -> str:
+    if not ids:
+        return "none"
+    more = len(ids) - cap
+    return "\n".join(f"<#{c}>" for c in ids[:cap]) + (
+        f"\n…and {more} more" if more > 0 else "")
+
+
+def _card_feature(label: str, cfg: dict) -> str:
+    if not cfg.get("enabled"):
+        return f"{label}: off"
+    bits = [f"{label}: on in {_chan(cfg.get('channel_id'), 'no channel set')}"]
+    bits.append("card" if cfg.get("card") else "no card")
+    if cfg.get("card") and cfg.get("background"):
+        bits.append("custom background")
+    if cfg.get("message"):
+        bits.append("custom message")
+    return " · ".join(bits)
+
+
+def status_fields(ctx: CommandContext, settings, gid: str
+                  ) -> list[tuple[str, str, bool]]:
+    """``(name, value, inline)`` for every server setting, in card order."""
+    out: list[tuple[str, str, bool]] = []
+    add = lambda n, v, i=False: out.append((n, v or "​", i))  # noqa: E731
+    extras = ctx.extras
+
+    # -- how he talks here ------------------------------------------------
+    add("Mode", settings.mode(gid), True)
+    add("General chat", _chan(settings.general_channel(gid)), True)
     here = ("silenced" if settings.is_silenced(gid, ctx.channel.id)
             else ("always-on" if settings.is_ai_channel(gid, ctx.channel.id)
                   else "mention-only"))
     if here != "silenced" and settings.is_presence_off(gid, ctx.channel.id):
         here += ", no chiming in"
-    embed.add_field("This channel", here, inline=True)
-    embed.add_field(
-        "Always-on channels",
-        "\n".join(f"<#{c}>" for c in ai[:15]) + (
-            f"\n…and {len(ai) - 15} more" if len(ai) > 15 else "")
-        if ai else "none",
-    )
-    if silenced:
-        embed.add_field(
-            "Silenced",
-            "\n".join(f"<#{c}>" for c in silenced[:15]) + (
-                f"\n…and {len(silenced) - 15} more" if len(silenced) > 15 else ""))
-    no_presence = sorted(settings.presence_off(gid)) if gid else []
-    if no_presence:
-        embed.add_field(
-            "No chiming in",
-            "\n".join(f"<#{c}>" for c in no_presence[:15]) + (
-                f"\n…and {len(no_presence) - 15} more"
-                if len(no_presence) > 15 else ""))
-    return embed
+    add("This channel", here, True)
+
+    add("Verified", _verified_line(settings, extras, gid), True)
+    features = extras.get("features")
+    if features is not None:
+        on = features.enabled(gid)
+        premium = " · ".join(f"{f}: {'on' if f in on else 'off'}"
+                             for f in ("voice", "streaming"))
+    else:
+        premium = "unknown (allowlist not loaded)"
+    add("Voice & streaming", premium, True)
+
+    add("Always-on channels", _channel_list(sorted(settings.ai_channels(gid))))
+    add("Silenced", _channel_list(sorted(settings.silenced(gid))))
+    add("No chiming in", _channel_list(sorted(settings.presence_off(gid))))
+
+    # -- ranking ------------------------------------------------------------
+    if settings.ranking_enabled(gid):
+        rank = ("on · level-ups in "
+                + _chan(settings.ranking_channel(gid),
+                        "the channel they leveled up in"))
+    else:
+        rank = "off"
+    from ..core.ranking import RankRoles
+    roles = extras.get("rank_roles") or RankRoles(settings)
+    tiers = roles.tiers(gid)
+    rank += (f"\nRank roles: {'custom' if roles.custom(gid) else 'default'}"
+             f", {len(tiers)} tier{'s' if len(tiers) != 1 else ''}")
+    add("Ranking", rank)
+
+    # -- members coming and going -------------------------------------------
+    greet = settings.greeting(gid)
+    greeting = ("AI-written welcomes: on" + (" (with extra info)"
+                                             if greet.get("custom_info") else "")
+                if greet.get("enabled") else "AI-written welcomes: off")
+    add("Welcome & farewell", "\n".join((
+        _card_feature("Welcome", settings.welcome(gid)),
+        _card_feature("Farewell", settings.farewell(gid)),
+        greeting)))
+
+    from ..core.audit import CATEGORIES, normalise_categories
+    audit = settings.audit(gid)
+    if audit.get("enabled"):
+        cats = normalise_categories(audit.get("categories"))
+        add("Audit log", f"on in {_chan(audit.get('channel_id'), 'no channel set')}"
+                         f" · {sum(cats.values())} of {len(CATEGORIES)} "
+                         "event types")
+    else:
+        add("Audit log", "off")
+    add("Spam honeypot", _chan(settings.honeypot(gid), "off"), True)
+    add("Verse finder", "on" if settings.versefinder_enabled(gid) else "off",
+        True)
+
+    # -- scheduled posts ------------------------------------------------------
+    quote = settings.daily_quote(gid)
+    add("Daily quote",
+        f"on in {_chan(quote.get('channel_id'), 'no channel set')} at "
+        f"{int(quote.get('hour', 8)):02d}:{int(quote.get('minute', 0)):02d} UTC"
+        if quote.get("enabled") else "off", True)
+    animals = settings.hourly_animals(gid)
+    add("Hourly animals",
+        f"on in {_chan(animals.get('channel_id'), 'no channel set')}"
+        f" ({animals.get('animal') or 'random'})"
+        if animals.get("enabled") else "off", True)
+    add("Full moon", _chan(settings.fullmoon(gid), "off"), True)
+    alerts = settings.weather_alerts(gid)
+    add("Weather alerts", "\n".join(
+        f"{a.get('location', '?')} at {int(a.get('hour', 0)):02d}:"
+        f"{int(a.get('minute', 0)):02d} {a.get('tz', 'UTC')} in "
+        f"{_chan(a.get('channel_id'), 'no channel')}" for a in alerts)
+        if alerts else "none")
+
+    from ..core.banner import BannerSettings, describe_interval
+    banners = BannerSettings(settings)
+    bcfg = banners.get(gid)
+    if bcfg.get("channel_id"):
+        banner = (f"from <#{bcfg['channel_id']}>, "
+                  f"{describe_interval(banners.interval(gid))}"
+                  + ("" if bcfg.get("enabled") else " (paused)"))
+        if bcfg.get("last_error"):
+            banner += f"\n⚠️ {str(bcfg['last_error'])[:200]}"
+    else:
+        banner = "not set up"
+    add("Banner rotation", banner)
+
+    add("Events calendar", _events_line(extras, settings, gid))
+
+    # -- roles ----------------------------------------------------------------
+    from ..core.reaction_roles import ReactionRoleStore
+    rr = extras.get("reaction_roles") or ReactionRoleStore(settings.store)
+    msgs = rr.messages(gid)
+    if msgs:
+        pairs = sum(len(e.get("roles") or {}) for e in msgs.values())
+        dm = len(rr.dm_roles(gid))
+        chans = sorted({str(e.get("channel_id")) for e in msgs.values()
+                        if e.get("channel_id")})
+        add("Reaction roles",
+            f"{len(msgs)} message{'s' if len(msgs) != 1 else ''}, {pairs} "
+            f"role{'s' if pairs != 1 else ''} ({dm} opt-in DM) in "
+            + ", ".join(f"<#{c}>" for c in chans[:5])
+            + (f" and {len(chans) - 5} more" if len(chans) > 5 else ""))
+    else:
+        add("Reaction roles", "none")
+
+    # -- TV and videos ----------------------------------------------------
+    rules = extras.get("tv_rules")
+    if rules is None:
+        from ..core.tv_rules import TVRules
+        rules = TVRules(settings)
+    if rules.enabled(gid):
+        allow, block = (rules.allowed_categories(gid),
+                        rules.blocked_categories(gid))
+        cats = (f"only {', '.join(allow)}" if allow else
+                f"no {', '.join(block)}" if block else "all categories")
+        limit = rules.max_minutes(gid)
+        tv = (f"on · {cats} · "
+              f"{'limit ' + str(limit) + ' min' if limit else 'no time limit'}"
+              f" · {rules.quality(gid).name} · "
+              f"{len(rules.favourites(gid))} favourite(s)")
+    else:
+        tv = "off"
+    from ..core.video_player import VideoPlayer
+    autoplay = settings.store.get(gid, VideoPlayer.AUTOPLAY, True) is not False
+    tv += f"\nVideo library autoplay: {'on' if autoplay else 'off'}"
+    if features is not None and "streaming" not in features.enabled(gid):
+        tv += "\n(streaming isn't enabled for this server)"
+    add("Live TV & videos", tv)
+    return out
+
+
+def _events_line(extras, settings, gid: str) -> str:
+    from ..core.events import EventStore
+
+    store = extras.get("events") or EventStore(settings)
+    cfg = store.get(gid)
+    if not cfg.get("channel_id"):
+        return "not set up"
+    upcoming = len(store.upcoming(gid))
+    subs = len(cfg.get("subscribers") or {})
+    return (f"<#{cfg['channel_id']}> · {upcoming} upcoming · {subs} "
+            f"subscribed · timezone {cfg.get('tz') or 'not set'}")
+
+
+def _verified_line(settings, extras, gid: str) -> str:
+    """The owner's ``verify``."""
+    return "yes" if settings.is_verified(gid) else "no"

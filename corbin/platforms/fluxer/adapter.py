@@ -352,6 +352,12 @@ def render_embed(embed: Embed, embed_cls: Any) -> Any:
 # Adapter
 # --------------------------------------------------------------------------
 
+def is_missing_permissions(exc: BaseException) -> bool:
+    """Fluxer's 403 for an action this bot isn't allowed to take."""
+    return (type(exc).__name__ == "Forbidden"
+            or "MISSING_PERMISSIONS" in str(exc))
+
+
 class FluxerAdapter:
     """Implements :class:`~corbin.platforms.base.PlatformAdapter` over fluxer.py."""
 

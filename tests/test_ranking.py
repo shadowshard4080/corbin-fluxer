@@ -263,9 +263,13 @@ def suite_custom_roles(r: Results) -> None:
 
     with tempfile.TemporaryDirectory() as tmp:
         cs = ChatSettings(Path(tmp) / "c.json")
+        # Servers set up before 2026-11-17: ranking was switched on, and
+        # they keep the original defaults.
+        for gid in ("g", "h", "s"):
+            cs.set_ranking(gid, True)
         roles = RankRoles(cs)
-        r.check("a new server has the defaults", roles.tiers("g"),
-                ROLE_TIERS)
+        r.check("a server set up before has the original defaults",
+                roles.tiers("g"), ROLE_TIERS)
         r.ok("...and isn't marked custom", not roles.custom("g"))
         r.check("default title", roles.role_for("g", 30), "Moongazer")
 
@@ -390,7 +394,238 @@ def suite_custom_roles(r: Results) -> None:
          "while True:" in body and "xp.pop_level_up()" in body)
 
 
+def suite_setup_questions(r: Results) -> None:
+    """"enable ranking" asks where level-ups go and which roles before
+    making anything (owner, 2026-11-17), and a server set up before
+    keeps what it has."""
+    import asyncio
+    from types import SimpleNamespace
+
+    from corbin.commands import ranking_cmds as R
+    from corbin.core.context import (Channel, CommandContext, Guild, Member,
+                                     Platform, Surface, User)
+    from corbin.core.ranking import (CLASSIC, STANDARD, STANDARD_TIERS,
+                                     RankRoles)
+    from corbin.core.settings import ChatSettings
+
+    r.check("new defaults run Newbie to Visionary",
+            (STANDARD_TIERS[min(STANDARD_TIERS)][0],
+             STANDARD_TIERS[max(STANDARD_TIERS)][0]),
+            ("Newbie", "Visionary"))
+
+    class _Http:
+        def __init__(self, channels):
+            self.channels, self.made, self.perms = channels, [], []
+            self.modified = []
+
+        async def get_guild_channels(self, gid):
+            return self.channels
+
+        async def create_guild_channel(self, gid, **kw):
+            self.made.append(kw)
+            return {"id": "900"}
+
+        async def edit_channel_permissions(self, cid, target, **kw):
+            self.perms.append((cid, target, kw))
+
+        async def modify_channel(self, cid, **kw):
+            self.modified.append((cid, kw))
+
+    class _Adapter:
+        def __init__(self, channels=()):
+            self.http = _Http(list(channels))
+            self.roles = []
+            self.client = SimpleNamespace(user=SimpleNamespace(id="bot"))
+
+        async def fetch_member(self, gid, uid):
+            return SimpleNamespace(roles=[SimpleNamespace(id="g"),
+                                          SimpleNamespace(id="botrole")])
+
+        def _rest(self):
+            return self.http
+
+        async def ensure_rank_roles(self, gid, tiers):
+            self.roles.append(dict(tiers))
+            return {n: "1" for n, _c in tiers.values()}, []
+
+    class _Resp:
+        async def send(self, *a, **k):
+            return None
+
+    def setup(tmp, adapter, *, owner=True):
+        cs = ChatSettings(Path(tmp) / "c.json")
+        roles = RankRoles(cs)
+        questions: dict = {}
+        extras = {"settings": cs, "rank_roles": roles, "adapter": adapter,
+                  "ranking_questions": questions,
+                  "channel_index": {"general": "111", "levels": "222"}}
+        member = Member(user=User(id="u", name="Admin"), guild_id="g",
+                        is_guild_owner=owner)
+        ctx = CommandContext(
+            platform=Platform.FLUXER, surface=Surface.AI, invoker=member,
+            channel=Channel(id="here", name="chat", guild_id="g",
+                            is_dm=False),
+            guild=Guild(id="g", name="Test Server"), responder=_Resp(),
+            extras=extras)
+        return cs, roles, questions, extras, member, ctx
+
+    run_ = asyncio.run
+
+    def say(questions, extras, member, text, mentioned=None):
+        return run_(R.answer_setup(
+            questions, extras, guild_id="g", channel_id="here",
+            member=member, content=text, mentioned=mentioned or {},
+            index=extras["channel_index"]))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ad = _Adapter()
+        cs, roles, qs, ex, m, ctx = setup(tmp, ad)
+        out = run_(R.setup_ranking(ctx, True))
+        r.ok("a new server is asked about the channel first",
+             out == R.CHANNEL_QUESTION)
+        r.ok("...and nothing is switched on or made yet",
+             not cs.ranking_enabled("g") and not ad.roles
+             and not ad.http.made)
+        r.check("chat isn't taken as the answer",
+                say(qs, ex, m, "lol did you see that"), None)
+        out = say(qs, ex, m, "#levels", {"222": "levels"})
+        r.ok("an existing channel, then the roles question",
+             "Newbie" in out and "Visionary" in out)
+        r.ok("still nothing switched on", not cs.ranking_enabled("g"))
+        out = say(qs, ex, m, "default")
+        r.ok("default: ranking on in that channel",
+             cs.ranking_enabled("g") and cs.ranking_channel("g") == "222"
+             and "<#222>" in out)
+        r.check("default: the new roles are made", ad.roles[-1],
+                STANDARD_TIERS)
+        r.check("pinned to the new defaults", roles.generation("g"),
+                STANDARD)
+        r.ok("question closed", not qs)
+        out = run_(R.setup_ranking(ctx, True))
+        r.ok("enabling again asks nothing and keeps the channel",
+             "<#222>" in out and not qs)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ad = _Adapter([{"id": "here", "name": "chat", "type": 0,
+                        "parent_id": "cat"}])
+        cs, roles, qs, ex, m, ctx = setup(tmp, ad)
+        run_(R.setup_ranking(ctx, True))
+        say(qs, ex, m, "Corbin, make one")
+        out = say(qs, ex, m, "1 Pup, 10 Wolf #ffaa00; 50 Elder")
+        r.check("make one: #level-ups created in the asker's category",
+                (ad.http.made[0]["name"], ad.http.made[0]["parent_id"]),
+                ("level-ups", "cat"))
+        everyone = [kw for _c, t, kw in ad.http.perms if t == "g"]
+        r.ok("...everyone may post and react (owner, 2026-11-18)",
+             everyone and all(
+                 int(everyone[0]["allow"]) & int(bit)
+                 for bit in (R.Perm.SEND_MESSAGES, R.Perm.ADD_REACTIONS,
+                             R.Perm.USE_EXTERNAL_EMOJIS))
+             and everyone[0]["deny"] == "0")
+        r.check("...with a 30-second slowmode", ad.http.modified,
+                [("900", {"rate_limit_per_user": 30})])
+        r.ok("...and he can, as himself", any(
+            t == "bot" and kw["type"] == 1 for _c, t, kw in ad.http.perms))
+        r.ok("...and through his own role (live 2026-11-18: the member "
+             "overwrite alone left him unable to post)", any(
+                 t == "botrole" and kw["type"] == 0
+                 and int(kw["allow"]) & int(R.Perm.SEND_MESSAGES)
+                 for _c, t, kw in ad.http.perms))
+        r.ok("...with Manage Messages, to post past the slowmode", any(
+            t == "bot" and int(kw["allow"]) & int(R.Perm.MANAGE_MESSAGES)
+            for _c, t, kw in ad.http.perms))
+        r.ok("...which @everyone doesn't get", not any(
+            t == "g" and int(kw["allow"]) & int(R.Perm.MANAGE_MESSAGES)
+            for _c, t, kw in ad.http.perms))
+        r.check("own roles parsed, colour optional", roles.tiers("g"),
+                {1: ("Pup", 0x99AAB5), 10: ("Wolf", 0xFFAA00),
+                 50: ("Elder", 0x99AAB5)})
+        r.ok("ranking on in the new channel",
+             cs.ranking_channel("g") == "900" and "<#900>" in out)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ad = _Adapter([{"id": "77", "name": "level-ups", "type": 0}])
+        cs, roles, qs, ex, m, ctx = setup(tmp, ad)
+        run_(R.setup_ranking(ctx, True, channel="general"))
+        r.ok("a named channel skips straight to roles", qs and next(
+            iter(qs.values()))["stage"] == "roles")
+        out = say(qs, ex, m, "no roles")
+        r.ok("no roles: on, nothing made",
+             cs.ranking_enabled("g") and not ad.roles
+             and roles.tiers("g") == {} and "No rank roles" in out)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ad = _Adapter([{"id": "77", "name": "level-ups", "type": 0}])
+        cs, roles, qs, ex, m, ctx = setup(tmp, ad, owner=False)
+        run_(R.setup_ranking(ctx, True))
+        out = say(qs, ex, m, "make one")
+        r.ok("making a channel needs Manage Channels",
+             "Manage Channels" in out and not ad.http.made)
+        r.ok("own with no list asks for it",
+             "list them" in (say(qs, ex, m, "general") and
+                             say(qs, ex, m, "my own")))
+        r.ok("a bad list is explained",
+             "needs a level" in say(qs, ex, m, "my own: Pup, 10 Wolf"))
+        r.ok("cancel drops it",
+             "nothing changed" in say(qs, ex, m, "cancel")
+             and not qs and not cs.ranking_enabled("g"))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        # A server set up before: ranking on, no stored roles, a channel.
+        ad = _Adapter()
+        cs, roles, qs, ex, m, ctx = setup(tmp, ad)
+        cs.set_ranking("g", True)
+        cs.set_ranking_channel("g", "555")
+        out = run_(R.setup_ranking(ctx, True))
+        r.ok("set up before: no questions, its channel kept",
+             not qs and "<#555>" in out)
+        r.check("...and the original roles", ad.roles[-1], ROLE_TIERS)
+        r.check("generation is classic", roles.generation("g"), CLASSIC)
+        roles.set("g", 10, "Pup")
+        roles.reset("g")
+        r.check("a reset goes back to its own defaults", roles.tiers("g"),
+                ROLE_TIERS)
+        # Switched off long ago, never customised: still the original.
+        cs.set_ranking("h", False)
+        r.check("ranking turned off still counts as set up",
+                roles.tiers("h"), ROLE_TIERS)
+        r.check("a server never set up gets the new list",
+                roles.tiers("new"), STANDARD_TIERS)
+        roles.set("new", 5, "Pup")
+        r.ok("customising a new server builds on the new list",
+             roles.tiers("new")[1][0] == "Newbie"
+             and roles.generation("new") == STANDARD)
+        cs.set_ranking("new", True)
+        r.check("...and stays there once ranking is on",
+                roles.generation("new"), STANDARD)
+
+    src = (Path(__file__).resolve().parent.parent / "bot.py").read_text(
+        encoding="utf-8")
+    r.ok("bot.py routes answers to the setup questions",
+         "_answer_ranking_setup(gid, channel_id" in src
+         and '"ranking_questions": ranking_questions' in src)
+    # Live 2026-11-18: executor.extras has no adapter (runtime adds it
+    # per command), and finishing the setup raised KeyError.
+    body = src[src.index("async def _answer_ranking_setup"):]
+    body = body[:body.index("\n    async def ", 10)]
+    r.ok("the answer handler hands finish_setup the adapter",
+         '"adapter": adapter' in body)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        ad = _Adapter()
+        cs, roles, qs, ex, m, ctx = setup(tmp, ad)
+        run_(R.setup_ranking(ctx, True, channel="general"))
+        broken = {k: v for k, v in ex.items() if k != "adapter"}
+        try:
+            say(qs, broken, m, "default")
+        except KeyError:
+            pass
+        r.ok("a failed finish leaves the question open", bool(qs))
+        r.ok("...so answering again works",
+             "<#111>" in say(qs, ex, m, "default") and not qs)
+
 SUITES = [
+    ("setup questions", suite_setup_questions),
     ("ranking formulas", suite_formulas),
     ("custom rank roles", suite_custom_roles),
     ("channel resolution", suite_channel_resolution),

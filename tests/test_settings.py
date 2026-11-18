@@ -312,11 +312,97 @@ def suite_silence(r: Results) -> None:
              and "permission" in res.message)
 
 
+def suite_status_card(r: Results) -> None:
+    """corbin-status shows every server setting, set or not (owner,
+    2026-11-17), and a fully configured server still fits the embed:
+    the adapter drops fields past EMBED_MAX_FIELDS with no warning."""
+    import time as _t
+    import corbin.commands  # noqa: F401  (registers the commands)
+    from corbin.core.context import EMBED_FIELD_VALUE_LIMIT, EMBED_MAX_FIELDS
+    from corbin.core.registry import registry
+    status = registry.get("chat_status")
+    expected = {"Mode", "General chat", "This channel", "Verified", "Voice & streaming", "Always-on channels",
+                "Silenced", "No chiming in", "Ranking", "Welcome & farewell",
+                "Audit log", "Spam honeypot", "Verse finder", "Daily quote",
+                "Hourly animals", "Full moon", "Weather alerts",
+                "Banner rotation", "Events calendar",
+                "Reaction roles", "Live TV & videos"}
+    with tempfile.TemporaryDirectory() as tmp:
+        cs = ChatSettings(Path(tmp) / "chat.json")
+        card = asyncio.run(status.handler(_ctx(cs)))
+        values = {f.name: f.value for f in card.fields}
+        r.check("a blank server shows every setting",
+                sorted(expected - set(values)), [])
+        r.check("ranking reads off", values["Ranking"].split("\n")[0], "off")
+        r.check("quote reads off", values["Daily quote"], "off")
+        r.check("banner reads not set up", values["Banner rotation"],
+                "not set up")
+        r.check("events read not set up", values["Events calendar"],
+                "not set up")
+        r.check("not verified", values["Verified"], "no")
+
+        # Everything on, at its longest.
+        g = "g1"
+        cs.set_ranking(g, True); cs.set_ranking_channel(g, "c5")
+        cs.set_welcome(g, enabled=True, channel_id="c6", card=True,
+                       background=True, message="hi")
+        cs.set_farewell(g, enabled=True, channel_id="c6")
+        cs.set_greeting(g, enabled=True, custom_info="read #rules")
+        cs.set_audit(g, enabled=True, channel_id="c7")
+        cs.set_daily_quote(g, enabled=True, channel_id="c8", hour=9)
+        cs.set_hourly_animals(g, enabled=True, channel_id="c9",
+                              animal="fox")
+        cs.set_versefinder(g, True); cs.set_honeypot(g, "c10")
+        cs.set_fullmoon(g, "c11")
+        cs.set_weather_alerts(g, [
+            {"location": f"Somewhere Long Named {i}", "hour": 7,
+             "minute": 0, "tz": "America/Los_Angeles",
+             "channel_id": "123456789012345678"} for i in range(10)])
+        cs.set_general_channel(g, "c2")
+        for i in range(40):
+            cs.add_ai_channel(g, f"1234567890123456{i:02d}")
+            cs.set_silenced(g, f"2234567890123456{i:02d}", True)
+            cs.set_presence_off(g, f"3234567890123456{i:02d}", True)
+        cs.store.set(g, "banner_rotation", {"enabled": True,
+                     "channel_id": "c12", "interval": 43200,
+                     "last_error": "x" * 900})
+        cs.store.set(g, "live_tv", {"block": ["sports", "news", "kids"],
+                                    "max_minutes": 120,
+                                    "favourites": ["a", "b"]})
+        cs.store.set(g, "events", {"channel_id": "c14", "tz": "UTC",
+                                   "subscribers": {"u": {}}})
+        cs.set_verified(g, True)
+        card = asyncio.run(status.handler(_ctx(cs)))
+        values = {f.name: f.value for f in card.fields}
+        r.ok("fits the field cap", len(card.fields) <= EMBED_MAX_FIELDS)
+        r.ok("no field over the value limit",
+             all(len(f.value) <= EMBED_FIELD_VALUE_LIMIT
+                 for f in card.fields))
+        total = sum(len(f.name) + len(f.value) for f in card.fields) + \
+            len(card.title or "") + len(card.description or "")
+        r.ok(f"whole card under 6,000 chars ({total})", total <= 6000)
+        r.ok("ranking shows its channel", "<#c5>" in values["Ranking"])
+        r.ok("quote shows channel and time",
+             "<#c8>" in values["Daily quote"]
+             and "09:00" in values["Daily quote"])
+        r.ok("banner shows its interval",
+             "every 12 hours" in values["Banner rotation"])
+        r.ok("events show their channel and subscribers",
+             "<#c14>" in values["Events calendar"]
+             and "1 subscribed" in values["Events calendar"])
+        r.ok("tv shows its rules", "no sports" in values["Live TV & videos"]
+             and "120 min" in values["Live TV & videos"])
+        r.ok("long lists say how many more",
+             "…and 30 more" in values["Silenced"])
+        r.check("verified", values["Verified"], "yes")
+
+
 SUITES = [
     ("settings store", suite_store),
     ("chat settings", suite_chat_settings),
     ("config commands", suite_config_commands),
     ("silence", suite_silence),
+    ("status card", suite_status_card),
 ]
 
 if __name__ == "__main__":

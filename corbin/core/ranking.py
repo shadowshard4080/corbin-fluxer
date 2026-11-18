@@ -58,6 +58,24 @@ def load_role_tiers(path: Optional[str]) -> dict[int, tuple[str, int]]:
 
 ROLE_TIERS = load_role_tiers(os.environ.get("RANK_ROLES_FILE"))
 
+#: The defaults for a server set up from 2026-11-17 on: Newbie up to
+#: Visionary. Servers set up before keep :data:`ROLE_TIERS` (see
+#: :meth:`RankRoles.generation`). A RANK_ROLES_FILE wins for both: an
+#: operator who chose their own list meant it everywhere.
+STANDARD_TIERS: dict[int, tuple[str, int]] = (
+    dict(ROLE_TIERS) if os.environ.get("RANK_ROLES_FILE") else {
+        1: ("Newbie", 0x95A5A6),
+        25: ("Regular", 0x2ECC71),
+        50: ("Contributor", 0x3498DB),
+        100: ("Veteran", 0x9B59B6),
+        175: ("Expert", 0xE67E22),
+        250: ("Legend", 0xE74C3C),
+        500: ("Visionary", 0xF1C40F),
+    })
+#: ``rank_roles["defaults"]``: which default list a server is on.
+CLASSIC, STANDARD = "classic", "standard"
+DEFAULT_SETS = {CLASSIC: ROLE_TIERS, STANDARD: STANDARD_TIERS}
+
 _UNSAFE = re.compile(r"[^A-Za-z0-9_-]")
 
 
@@ -128,7 +146,8 @@ def next_role(level: int, tiers: Optional[dict[int, tuple[str, int]]]
 
 #: Per-server rank roles (owner, 2026-10-20): ``rank_roles`` in that
 #: guild's chat settings, ``{"tiers": {"<level>": [name, colour]},
-#: "retired": [names]}``. Absent = :data:`ROLE_TIERS`.
+#: "retired": [names], "defaults": "classic"|"standard"}``. No tiers =
+#: that server's defaults (:meth:`RankRoles.generation`).
 MAX_TIERS = 25
 MAX_TIER_LEVEL = 1000
 MAX_RETIRED = 50
@@ -160,16 +179,74 @@ class RankRoles:
             return {}
         return raw if isinstance(raw, dict) else {}
 
+    def generation(self, guild_id: Optional[str]) -> str:
+        """Which default list this server is on. Stored once known;
+        otherwise a server that ever had ranking switched on or off was
+        set up on :data:`ROLE_TIERS` and keeps it (owner, 2026-11-17:
+        "I don't want to override what's already set up"), and one that
+        never did gets :data:`STANDARD_TIERS`."""
+        if not guild_id:
+            return STANDARD
+        stored = self._raw(str(guild_id)).get("defaults")
+        if stored in DEFAULT_SETS:
+            return stored
+        try:
+            touched = self.settings.store.get(str(guild_id),
+                                              "ranking") is not None
+        except Exception:
+            logger.warning("ranking state for %s unreadable; keeping the "
+                           "original rank roles", guild_id, exc_info=True)
+            return CLASSIC
+        return CLASSIC if touched else STANDARD
+
+    def defaults(self, guild_id: Optional[str]) -> dict[int, tuple[str, int]]:
+        return dict(DEFAULT_SETS[self.generation(guild_id)])
+
+    def never_set_up(self, guild_id: Optional[str]) -> bool:
+        """No ranking switch ever, and no rank roles chosen: the server
+        that "enable ranking" should ask about roles."""
+        if not guild_id:
+            return False
+        return (not self._raw(str(guild_id))
+                and self.generation(guild_id) == STANDARD)
+
+    def use_defaults(self, guild_id: str) -> None:
+        """Pin a new server to :data:`STANDARD_TIERS`."""
+        raw = self._raw(guild_id)
+        self.settings.store.set(str(guild_id), self.KEY, {
+            "defaults": STANDARD, "retired": raw.get("retired") or []})
+
+    def replace_all(self, guild_id: str,
+                    tiers: dict[int, tuple[str, int]]) -> None:
+        """A server's own list, whole (may be empty: no rank roles).
+        Raises ValueError as :meth:`set` does."""
+        check = {}
+        for level, (name, colour) in tiers.items():
+            level = int(level)
+            name = " ".join(str(name or "").split())[:100]
+            if not 1 <= level <= MAX_TIER_LEVEL:
+                raise ValueError(f"level {level} isn't between 1 and "
+                                 f"{MAX_TIER_LEVEL}")
+            if not name or name.lower() == "@everyone":
+                raise ValueError(f"level {level} needs a role name")
+            if any(n.lower() == name.lower() for n, _c in check.values()):
+                raise ValueError(f"**{name}** is in the list twice")
+            check[level] = (name, int(colour) & 0xFFFFFF)
+        if len(check) > MAX_TIERS:
+            raise ValueError(f"a server can have up to {MAX_TIERS} rank "
+                             "roles")
+        self._save(guild_id, check)
+
     def custom(self, guild_id: Optional[str]) -> bool:
         return bool(guild_id) and isinstance(
             self._raw(str(guild_id)).get("tiers"), dict)
 
     def tiers(self, guild_id: Optional[str]) -> dict[int, tuple[str, int]]:
         if not guild_id:
-            return dict(ROLE_TIERS)
+            return dict(STANDARD_TIERS)
         stored = self._raw(str(guild_id)).get("tiers")
         if not isinstance(stored, dict):
-            return dict(ROLE_TIERS)
+            return self.defaults(guild_id)
         out: dict[int, tuple[str, int]] = {}
         for level, value in stored.items():
             try:
@@ -207,6 +284,7 @@ class RankRoles:
                 retired.append(name)
         retired = [n for n in retired if n.lower() not in current]
         self.settings.store.set(str(guild_id), self.KEY, {
+            "defaults": self.generation(guild_id),
             "tiers": {str(k): [v[0], v[1]] for k, v in sorted(tiers.items())},
             "retired": retired[-MAX_RETIRED:],
         })
@@ -255,12 +333,16 @@ class RankRoles:
     def reset(self, guild_id: str) -> None:
         """Back to the defaults; any custom names are retired."""
         mine = [n for n, _c in self.tiers(guild_id).values()]
-        self._save(guild_id, dict(ROLE_TIERS), tuple(mine))
+        generation = self.generation(guild_id)
+        self._save(guild_id, self.defaults(guild_id), tuple(mine))
         raw = self._raw(guild_id)
         # The defaults, stored as "no custom tiers", keeping the retired
-        # list so the old custom roles are still stripped on sync.
+        # list so the old custom roles are still stripped on sync, and
+        # which defaults: a server set up on the original list resets
+        # to that list, never to the newer one.
         self.settings.store.set(str(guild_id), self.KEY,
-                                {"retired": raw.get("retired") or []})
+                                {"defaults": generation,
+                                 "retired": raw.get("retired") or []})
         logger.info("rank roles for %s back to the defaults", guild_id)
 
 

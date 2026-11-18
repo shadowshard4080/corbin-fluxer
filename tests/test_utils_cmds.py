@@ -335,7 +335,12 @@ def suite_reminder_zones(r: Results) -> None:
         out = asyncio.run(rc.remind(ctx("u1"), "tomorrow at 9pm PST", "y"))
         r.ok("a stated zone is used", "21:00 P" in out)
         fire = store.for_user("u1")[-1].fire_at
-        r.check("stored as their 9pm in UTC", fire.hour, 4)
+        # 04:00 UTC under daylight time, 05:00 in winter: computed, or
+        # the test fails every November.
+        from zoneinfo import ZoneInfo
+        local = fire.astimezone(ZoneInfo("America/Los_Angeles"))
+        r.check("stored as their 9pm in UTC", (local.hour, local.minute),
+                (21, 0))
         r.check("the stated zone is remembered",
                 memory.get_user("u1").timezone, "America/Los_Angeles")
 

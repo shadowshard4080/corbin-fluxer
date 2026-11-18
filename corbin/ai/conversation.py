@@ -238,7 +238,12 @@ def drop_repeats(text: str, earlier: Sequence[str],
         blocks.append(m.group(0))
         return f"\x00CODE{len(blocks) - 1}\x00"
 
-    masked = _FENCED_BLOCK.sub(_stash, text or "")
+    # A ```file:...``` / ```edit:...``` document block too: "send the
+    # doc again" must not lose paragraphs he sent the first time, and
+    # _FENCED_BLOCK's language tag can't hold the colon.
+    from corbin.core.doc_output import BLOCK as _DOC_BLOCK
+
+    masked = _FENCED_BLOCK.sub(_stash, _DOC_BLOCK.sub(_stash, text or ""))
     seen = [_norm_para(e) for e in earlier if e]
     kept = []
     for para in re.split(r"\n\s*\n", masked):
@@ -646,6 +651,7 @@ class Conversation:
                     set_aside: Optional[str] = None,
                     spoken: bool = False,
                     link_previews: Sequence[str] = (),
+                    documents_note: bool = False,
                     store: bool = True) -> Any:
         """Generate one conversational reply, or None to stay quiet.
 
@@ -707,6 +713,12 @@ class Conversation:
             from corbin.core.documents import prompt_block
 
             payload = f"{payload}\n\n{prompt_block(files)}"
+        if documents_note:
+            # How to send a file or edit theirs. Payload only, like the
+            # file contents: never stored as if they had typed it.
+            from corbin.core.doc_output import NOTE as _DOCS_NOTE
+
+            payload = f"{payload}\n\n{_DOCS_NOTE}"
         if link_previews:
             # Payload only: commit() stores user_content, so the preview
             # never enters history as if the member had typed it.

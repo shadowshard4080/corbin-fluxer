@@ -28,7 +28,12 @@ emoji, owner and the rest are yours to change (see [Make him yours](#make-him-yo
   cards (or AI-written welcomes), music from YouTube/Spotify links, internet
   radio, reminders, weather and daily weather alerts, moon phases and full-moon
   announcements, hourly animal pictures, a daily quote, bible verse lookup,
-  image search, and a daily usage digest.
+  image search, a daily usage digest, and a server events calendar with DM
+  reminders.
+- **Documents.** Reads text files, Word documents and PDFs people send him.
+  Asked for a file, he attaches a .txt, .md, .docx or .pdf; asked to change
+  a Word document, he edits the wording inside the original so its fonts
+  and layout stay.
 
 Ask him "what can you do?" for the full list in your server.
 
@@ -209,7 +214,10 @@ and chats without any of them, and logs one line saying which are off.
 | Reaction controls (verse, music, TV and video cards) | Manage Messages lets him reset each press | always on |
 | Reaction roles, opt-in DM roles | Manage Roles (and Manage Channels to make #reaction-roles) | "set up reaction roles" |
 | Banner rotation | Manage Server, and a server with the banner feature | "set up banner rotation" |
+| Ranking setup | Manage Server; Manage Roles for the roles, Manage Channels to make #level-ups | "set up the ranking system": he asks where level-ups go and which roles |
 | Rank roles per server | Manage Roles | "rank-role-set 10 Regular #ff8800" |
+| Events calendar | Manage Server to set up, Manage Messages to add events | "set up the calendar" |
+| PDFs he makes or reads | `pip install fpdf2 pypdf`, a DejaVu font (matplotlib ships one) | without them he says PDFs aren't available |
 | Encryption at rest | `pip install cryptography`, `DATA_KEY_FILE` | empty = plain JSON |
 | Log file | nothing | `LOG_FILE=` (empty) for stderr only |
 
@@ -230,6 +238,30 @@ time across all servers, and voice chat stops while it does.
 **Opt-in DM roles.** A reaction role can be marked as a DM role: only
 members who react for it themselves get it, and `messager` DMs only them.
 If anyone else hands it out (a moderator, another bot), he takes it back.
+
+**Ranking.** "Set up the ranking system" asks where level-ups go (an
+existing channel, here, or a new #level-ups where everyone can post with
+a 30-second slowmode) and which roles: the defaults (Newbie at level 1
+up to Visionary at 500), your own list (`1 Rookie, 10 Regular, 50
+Veteran #c0c0c0`), or none. Nothing is made until the last answer. A
+server that had ranking before keeps its roles; `RANK_ROLES_FILE`
+replaces the defaults everywhere.
+
+**Events calendar.** "Set up the calendar" makes #events with one card he
+keeps up to date. Mods add events in plain words, several at once ("add
+movie night Friday 8pm, game night 12/12/2026 7pm EST"); his reply spells
+out every date so a misread shows straight away. With no timezone
+written he uses the mod's own, then the server's ("events timezone
+Pacific"), and otherwise asks. Anyone who reacts 🔔 on the card is DMed
+"how long before each event?" ("1 day and 30 minutes", "none"), and the
+reminders arrive by DM. "Remove event 3", "what events are coming up?".
+
+**Documents.** Attach a file and ask for changes ("fix the typos in
+this") and he sends back an edited copy; ask for one ("make that a PDF")
+and he attaches it. He keeps an attached file for an hour, so a follow-up
+edit doesn't need it sent again. Word edits change wording only; adding
+or removing whole sections gets a new file instead, and PDFs can't be
+edited in place.
 
 **Memory opt-out.** Anyone can say "don't remember me": he deletes what he
 has about them and saves nothing new, in any server.

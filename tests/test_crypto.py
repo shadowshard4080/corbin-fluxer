@@ -38,7 +38,10 @@ def suite_files(r: Results) -> None:
             r.ok("a memory file is written encrypted",
                  crypto.is_encrypted(raw))
             r.ok("...with none of its text readable",
-                 b"sourdough" not in raw and b"42" not in raw)
+                 # Not b"42": random base64 contains it about one run in
+                 # fifteen.
+                 b"sourdough" not in raw and b"loves" not in raw
+                 and b'"42"' not in raw)
             r.ok("and reads back with the key",
                  "loves sourdough baking" in
                  " ".join(MemoryStore(root).get_user("42").facts))

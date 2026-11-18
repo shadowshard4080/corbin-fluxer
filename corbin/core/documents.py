@@ -169,11 +169,14 @@ def prompt_block(files: Sequence[tuple]) -> str:
     return "\n\n".join(parts)
 
 
-async def collect(message, fetch) -> list:
+async def collect(message, fetch, originals: Optional[dict] = None) -> list:
     """``(filename, text)`` for each readable non-image attachment.
 
     ``fetch`` is an async ``url -> bytes | None``; the vision module's
     downloader already enforces a size cap, so it is reused.
+    ``originals``, when given, receives ``{filename: Original}`` with the
+    raw bytes, so a reply can edit the file itself
+    (:mod:`corbin.core.doc_output`).
     """
     files: list = []
     for item in (getattr(message, "attachments", None) or ()):
@@ -194,6 +197,10 @@ async def collect(message, fetch) -> list:
             logger.info("could not read attachment %s as %s", name, kind)
             continue
         files.append((name, text))
+        if originals is not None:
+            from .doc_output import Original
+
+            originals[name] = Original(name, raw)
     if files:
         logger.info("files: reading %d attachment(s) with this reply: %s",
                     len(files), ", ".join(n for n, _ in files))
