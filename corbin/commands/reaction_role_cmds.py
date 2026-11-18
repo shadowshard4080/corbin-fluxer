@@ -20,7 +20,9 @@ from typing import Any, Mapping, Optional, Sequence
 
 from ..core.context import CommandContext, Embed, Response
 from ..core.permissions import Perm, resolve
-from ..core.reaction_roles import (CHANNEL_NAME, QUESTION_TTL, Emoji, Pair,
+from ..core.channel_access import grant_self
+from ..core.reaction_roles import (BOT_ALLOW, CHANNEL_NAME, QUESTION_TTL,
+                                   Emoji, Pair,
                                    ReactionRoleStore, ensure_channel,
                                    lookup_pair, parse_pairs, refusal,
                                    resolve_role, top_position)
@@ -343,6 +345,14 @@ async def reaction_roles(ctx: CommandContext,
             return (f"I couldn't make #{CHANNEL_NAME}: {problems[0]}. I need "
                     "Manage Channels and Manage Roles.")
         if created:
+            # ensure_channel's member overwrite alone didn't take for
+            # #level-ups (live 2026-11-18): the bot's roles get one too,
+            # and a failure is said here rather than in the log alone.
+            if not await grant_self(adapter, adapter._rest(), ctx.guild_id,
+                                    target, BOT_ALLOW):
+                problems.append("I couldn't give myself permission to post "
+                                "there; give my role Send Messages and Add "
+                                "Reactions in it")
             where = (f" under <#{anchor['id']}>" if anchor else
                      " at the top")
             note = (f"Made <#{target}>{where}. People can read it and click "

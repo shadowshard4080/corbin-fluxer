@@ -493,7 +493,47 @@ def suite_dm_optin(r: Results) -> None:
          "isn't an opt-in DM role" in reply)
 
 
+def suite_self_access(r: Results) -> None:
+    """Making #reaction-roles gives him access through his roles too,
+    not only a member overwrite (live 2026-11-18 on #level-ups: the
+    member overwrite alone left him unable to post)."""
+    from corbin.core.context import (Channel, CommandContext, Guild,
+                                     Platform, Surface)
+
+    http = FakeHTTP(CHANNELS)
+
+    class _Adapter:
+        client = types.SimpleNamespace(user=types.SimpleNamespace(id="555"))
+
+        def _rest(self):
+            return http
+
+        async def fetch_member(self, gid, uid):
+            return member("555", "5")
+
+    class _Resp:
+        async def send(self, *a, **k):
+            return None
+
+    ctx = CommandContext(
+        platform=Platform.FLUXER, surface=Surface.AI,
+        invoker=member("u1", "6", owner=True),
+        channel=Channel(id="c0", name="general", guild_id=GID),
+        guild=Guild(id=GID, name="Test Server"), responder=_Resp(),
+        extras={"adapter": _Adapter(), "reaction_role_questions": {},
+                "reaction_roles": rr.ReactionRoleStore(FakeSettings())})
+    out = asyncio.run(cmds.reaction_roles(ctx))
+    perms = [c for c in http.calls if c[0] == "perms"]
+    mine = [c[2] for c in perms if c[1] == "5"]
+    r.ok("his role is allowed to post and react", mine and mine[0]["type"]
+         == 0 and Perm(int(mine[0]["allow"])) & Perm.SEND_MESSAGES
+         and Perm(int(mine[0]["allow"])) & Perm.ADD_REACTIONS)
+    r.ok("...as well as himself", any(c[1] == "555" for c in perms))
+    r.ok("...and the setup still asks for the roles", "Which roles" in out)
+
+
 SUITES = [
+    ("his own access", suite_self_access),
     ("reaction roles: parsing", suite_parsing),
     ("reaction roles: role checks", suite_roles),
     ("reaction roles: placement", suite_placement),

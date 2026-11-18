@@ -493,6 +493,9 @@ async def servers(ctx: CommandContext) -> Any:
         on = allow.enabled(row["id"]) if allow is not None else frozenset()
         marks = " ".join(m for f, m in (("voice", "🎙️"),
                                         ("streaming", "📺")) if f in on)
+        settings = ctx.extras.get("settings")
+        if settings is not None and settings.is_verified(str(row["id"])):
+            marks = " ".join(m for m in ("✅", marks) if m)
         members = row.get("members")
         count = f"{members:,} members" if isinstance(members, int) \
             else "members unknown"
@@ -506,6 +509,6 @@ async def servers(ctx: CommandContext) -> Any:
                                if rows else "None at all."))
     if rows:
         embed.add_list_field("Servers", lines)
-        embed.footer = "🎙️ voice chat on · 📺 streaming on"
+        embed.footer = "✅ verified · 🎙️ voice chat on · 📺 streaming on"
     return Response(embed=embed, private=private,
                     private_notice="Sent my server list to your DMs.")

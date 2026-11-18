@@ -22,6 +22,7 @@ import test_expressions  # noqa: E402
 import test_health  # noqa: E402
 import test_media  # noqa: E402
 import test_documents  # noqa: E402
+import test_events  # noqa: E402
 import test_tool_calls  # noqa: E402
 import test_command_help  # noqa: E402
 import test_weather_alerts  # noqa: E402
@@ -73,6 +74,7 @@ if __name__ == "__main__":
                    + test_health.SUITES
                    + test_media.SUITES
                    + test_documents.SUITES
+                   + test_events.SUITES
                    + test_tool_calls.SUITES
                    + test_command_help.SUITES
                    + test_weather_alerts.SUITES

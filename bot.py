@@ -91,6 +91,8 @@ from corbin.core.reactions import (Panel, ReactionPanels,       # noqa: E402
                                    normalise, reaction_emoji)
 from corbin.core import vision                                 # noqa: E402
 from corbin.core import documents                              # noqa: E402
+from corbin.core import doc_output                             # noqa: E402
+from corbin.core import events as events_mod                   # noqa: E402
 from corbin.core import link_previews                          # noqa: E402
 from corbin.core.media import (media_labels,                    # noqa: E402
                                strip_emoji_ids)
@@ -139,11 +141,13 @@ from corbin.core.ranking import (RankingStore, RankRoles,       # noqa: E402
 from corbin.core.settings import ChatSettings                   # noqa: E402
 from corbin.core.risk import Decision                           # noqa: E402
 from corbin.platforms.base import FLUXER_CAPABILITIES           # noqa: E402
-from corbin.platforms.fluxer.adapter import (FluxerAdapter,     # noqa: E402
+from corbin.platforms.fluxer.adapter import (FluxerAdapter, is_missing_permissions,  # noqa: E402
                                              probe, to_member, to_message)
 from corbin.commands._notify import notify_target               # noqa: E402
 from corbin.commands.config_cmds import match_general_answer     # noqa: E402
 from corbin.commands import reaction_role_cmds                 # noqa: E402
+from corbin.commands import ranking_cmds                       # noqa: E402
+from corbin.commands import event_cmds                         # noqa: E402
 from corbin.core.reaction_roles import (ReactionRoleStore,      # noqa: E402
                                         event_key as rr_event_key)
 from corbin.commands.config_cmds import (                        # noqa: E402
@@ -163,6 +167,7 @@ import corbin.commands.moon_cmds    # noqa: E402,F401
 import corbin.commands.music_cmds   # noqa: E402,F401
 import corbin.commands.radio_cmds    # noqa: E402,F401
 import corbin.commands.reaction_role_cmds  # noqa: E402,F401
+import corbin.commands.event_cmds  # noqa: E402,F401
 import corbin.commands.reminder_cmds # noqa: E402,F401
 import corbin.commands.ranking_cmds  # noqa: E402,F401
 import corbin.commands.scheduled_cmds  # noqa: E402,F401
@@ -704,6 +709,18 @@ def main() -> int:
     #: (channel, user) -> {guild, target, message, deadline}: "which roles
     #: and emoji?" waiting on an answer. See _answer_reaction_roles.
     reaction_role_questions: dict = {}
+    #: (channel, user) -> {guild, stage, channel, make, here, deadline}:
+    #: "enable ranking" asking where level-ups go and which roles.
+    #: See _answer_ranking_setup.
+    ranking_questions: dict = {}
+    #: (dm channel, user) -> {guild, guild_name, deadline}: "how long
+    #: before each event?" after a 🔔 on a calendar. See
+    #: _answer_event_question.
+    event_questions: dict = {}
+    event_store = events_mod.EventStore(settings)
+    #: (channel, user) -> {guild, items, deadline}: "what timezone is
+    #: that in?" from events_add. See _answer_event_timezone.
+    event_tz_questions: dict = {}
     reaction_roles = ReactionRoleStore(settings.store)
     def _count_command(spec, ctx) -> None:
         """The digest's "Commands run" (Executor.on_command)."""
@@ -739,6 +756,9 @@ def main() -> int:
                        "silence_questions": silence_questions,
                        "reaction_roles": reaction_roles,
                        "reaction_role_questions": reaction_role_questions,
+                       "ranking_questions": ranking_questions,
+                       "events": event_store,
+                       "event_tz_questions": event_tz_questions,
                        "rank_roles": rank_roles}
 
     #: Bounded counter; see the PRESENCE_UPDATE hook in _dispatch.
@@ -959,6 +979,33 @@ def main() -> int:
     scheduler.add("daily_quote", _daily_quote_job)
     scheduler.add("hourly_animals", _hourly_animal_job)
     scheduler.add("weather_alerts", _weather_alerts_job)
+
+    async def _events_job() -> None:
+        """Event reminders by DM, and past events off the calendars."""
+        for gid in event_store.guilds():
+            try:
+                due = event_store.due(gid)
+                pruned = event_store.prune(gid)
+                name = ""
+                if due or pruned:
+                    info = await adapter.guild_info(gid)
+                    name = getattr(info, "name", "") or ""
+                for ev, uid, offset in due:
+                    text = events_mod.reminder_text(ev, offset,
+                                                    name or "a server")
+                    if await adapter.send_dm(uid, Response(content=text)):
+                        logger.info("events: reminded %s of #%s in %s",
+                                    uid, ev["id"], gid)
+                    else:
+                        logger.warning("events: reminder DM to %s for #%s "
+                                       "in %s failed", uid, ev["id"], gid)
+                if pruned:
+                    await event_cmds.refresh_calendar(adapter, event_store,
+                                                      gid, name)
+            except Exception:
+                logger.exception("events job failed for %s", gid)
+
+    scheduler.add("events", _events_job)
 
     # -- banner rotation (corbin/core/banner.py) ---------------------------
     from corbin.core import banner as banner_mod
@@ -1379,6 +1426,18 @@ def main() -> int:
             user_id = str(raw.user_id)
             if user_id == _me():
                 return
+            # A calendar card: 🔔 subscribes, anything else is ignored.
+            event_guild = event_store.find_calendar(
+                message_id, str(raw.guild_id) if raw.guild_id else None)
+            if event_guild is not None:
+                if normalise(emoji) == normalise(events_mod.BELL):
+                    info = await adapter.guild_info(event_guild)
+                    await event_cmds.bell(
+                        adapter, event_store, event_questions,
+                        guild_id=event_guild,
+                        guild_name=getattr(info, "name", "") or "",
+                        user_id=user_id, added=added)
+                return
             await panels.press(message_id=message_id, channel_id=channel_id,
                                user_id=user_id, emoji=emoji, added=added,
                                bot_user_id=_me())
@@ -1743,6 +1802,15 @@ def main() -> int:
             return
         if await _answer_reaction_roles(gid, channel_id, message, raw):
             return
+        if await _answer_ranking_setup(gid, channel_id, message, raw,
+                                       content, chan_map):
+            return
+        if gid is None and await _answer_event_question(channel_id, message,
+                                                         content):
+            return
+        if gid is not None and await _answer_event_timezone(
+                gid, channel_id, message, content):
+            return
 
         addressed = bool(me_id and me_id in message.content)
         # A reply only counts when it is a reply to HIM. Treating
@@ -1812,10 +1880,21 @@ def main() -> int:
                 index.update({name.lower(): cid for cid, name in chan_map.items()})
                 executor.extras["channel_index"] = index
 
-            result = await dispatcher.handle(
-                content, invoker=member, channel_id=channel_id,
-                guild_id=gid, directly_invoked=True, mention_ids=mention_ids,
-            )
+            if (gid and events_mod.match_add(content)
+                    and event_store.get(str(gid)).get("channel_id")):
+                # "Add these events to the calendar:" and a list: a
+                # classifier can score a long list under the floor and
+                # send it to chat. Permissions still apply.
+                logger.info("events: add request matched directly in %s",
+                            channel_id)
+                result = dispatcher.direct("events-add", {}, invoker=member,
+                                           guild_id=gid)
+            else:
+                result = await dispatcher.handle(
+                    content, invoker=member, channel_id=channel_id,
+                    guild_id=gid, directly_invoked=True,
+                    mention_ids=mention_ids,
+                )
             if quiet_here and not (result.spec is not None
                                    and works_while_quiet(result.spec.name)):
                 if result.decision is Decision.CONFIRM:
@@ -1860,6 +1939,27 @@ def main() -> int:
                           speaker=speaker,
                           guild_name=guild.name if guild else "")
 
+    #: (channel, user) -> {"at", "files", "originals"}: documents someone
+    #: attached, kept DOCUMENT_MEMORY seconds for follow-up edits.
+    recent_documents: dict = {}
+    DOCUMENT_MEMORY = 3600.0
+
+    def _remember_documents(key, files, originals) -> None:
+        now = _monotonic()
+        for k in [k for k, v in recent_documents.items()
+                  if now - v["at"] > DOCUMENT_MEMORY]:
+            recent_documents.pop(k, None)
+        recent_documents[key] = {"at": now, "files": list(files),
+                                 "originals": dict(originals)}
+        while len(recent_documents) > 200:
+            recent_documents.pop(next(iter(recent_documents)))
+
+    def _recent_documents(key):
+        entry = recent_documents.get(key)
+        if entry is None or _monotonic() - entry["at"] > DOCUMENT_MEMORY:
+            return None
+        return entry
+
     async def _post_reply(channel_id: str, gid, reply: str, *,
                           user_id: str, speaker: str,
                           guild_name: str = "",
@@ -1877,16 +1977,35 @@ def main() -> int:
                             guild_id=gid, guild_name=guild_name)
         # Long code goes up as a file. History above keeps the inline
         # version, so he still knows what he sent.
+        # Documents first: a ```file:``` block is not code (doc_output).
         body, code_files = reply, []
         if adapter.capabilities().file_upload:
-            body, code_files = extract_code_files(reply)
+            if doc_output.has_blocks(body):
+                earlier = _recent_documents((str(channel_id), str(user_id)))
+                body, doc_files = await asyncio.to_thread(
+                    doc_output.extract, body,
+                    earlier["originals"] if earlier else {})
+                code_files.extend(doc_files)
+            body, more = extract_code_files(body)
+            code_files.extend(more)
         chunks = split_message(body)
         sent_ids = []
         for i, chunk in enumerate(chunks):
             files = tuple(code_files) if i == len(chunks) - 1 else ()
-            sent_id = await adapter.send(channel_id, Response(
-                content=chunk, files=files,
-                reply_to=reply_to if i == 0 else None))
+            try:
+                sent_id = await adapter.send(channel_id, Response(
+                    content=chunk, files=files,
+                    reply_to=reply_to if i == 0 else None))
+            except Exception as exc:
+                if not (isinstance(exc, PermissionError)
+                        or is_missing_permissions(exc)):
+                    raise
+                # A channel it can read but not post in. One warning
+                # naming it, not an on_message traceback.
+                logger.warning("can't answer %s in %s: %s (give my role "
+                               "Send Messages there)", speaker, channel_id,
+                               exc)
+                return
             _remember_own_message(sent_id, channel_id, chunk)
             sent_ids.append(sent_id)
         # The success path used to log nothing, so "generated a reply but
@@ -1955,6 +2074,60 @@ def main() -> int:
         conversation.record(channel_id, conversation.bot_name, reply,
                             is_bot=True)
         presence.mark_spoke(gid, channel_id)
+        sent_id = await adapter.send(channel_id, Response(content=reply))
+        _remember_own_message(sent_id, channel_id, reply)
+        return True
+
+    async def _answer_event_question(channel_id: str, message,
+                                     content: str) -> bool:
+        """Take a DM answer to "how long before each event?" (asked
+        after a 🔔 on a calendar)."""
+        reply = event_cmds.answer_reminder_question(
+            event_questions, event_store, channel_id=channel_id,
+            user_id=str(message.author.id), content=content)
+        if reply is None:
+            return False
+        sent_id = await adapter.send(channel_id, Response(content=reply))
+        _remember_own_message(sent_id, channel_id, reply)
+        return True
+
+    async def _answer_event_timezone(gid, channel_id: str, message,
+                                     content: str) -> bool:
+        """Take the mod's answer to "what timezone is that in?"."""
+        if (str(channel_id), str(message.author.id)) not in \
+                event_tz_questions:
+            return False
+        info = await adapter.guild_info(gid)
+        reply = await event_cmds.answer_timezone_question(
+            event_tz_questions, {"adapter": adapter, **executor.extras},
+            guild_id=str(gid), guild_name=getattr(info, "name", "") or "",
+            channel_id=channel_id, user_id=str(message.author.id),
+            content=content)
+        if reply is None:
+            return False
+        sent_id = await adapter.send(channel_id, Response(content=reply))
+        _remember_own_message(sent_id, channel_id, reply)
+        return True
+
+    async def _answer_ranking_setup(gid, channel_id: str, message, raw,
+                                    content: str, chan_map) -> bool:
+        """Take a reply to "enable ranking"'s questions (which channel,
+        which roles). Same rules as the general-chat question: the
+        person asked, in that channel, within 10 minutes, and only a
+        clear answer; anything else is handled as normal."""
+        if (str(channel_id), str(message.author.id)) not in \
+                ranking_questions:
+            return False
+        member, _guild = await _member_for(gid, raw, message.author.id)
+        index = await adapter.guild_channel_index(gid) if gid else {}
+        reply = await ranking_cmds.answer_setup(
+            # executor.extras has no adapter: runtime adds it per
+            # command, so a handler outside a command passes it itself.
+            ranking_questions, {"adapter": adapter, **executor.extras},
+            guild_id=gid, channel_id=channel_id, member=member,
+            content=content, mentioned=chan_map, index=index)
+        if reply is None:
+            return False
         sent_id = await adapter.send(channel_id, Response(content=reply))
         _remember_own_message(sent_id, channel_id, reply)
         return True
@@ -2651,10 +2824,13 @@ def main() -> int:
             (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"))
 
     def _set_aside(result):
-        """The command a message mentioned without asking for, if any."""
+        """The command a message matched that did NOT run, if any: one
+        read as mentioned rather than requested, or a guess under the
+        confidence floor (``suggest``). Both reach the reply as
+        [Tool:CommandNotRun], or the model may say it did the thing."""
         if result.decision is Decision.NOT_A_COMMAND:
             return result.spec
-        return None
+        return result.suggest
 
     async def _converse(content, member, speaker, channel_id, guild, message,
                         *, spoken: bool = False,
@@ -2680,10 +2856,27 @@ def main() -> int:
         if message is not None:
             # Images only reach a model that can see them.
             images = await _collect_images(message)
-            files = await documents.collect(message, vision.fetch)
+            originals: dict = {}
+            files = await documents.collect(message, vision.fetch,
+                                            originals=originals)
             channel_name = message.channel.name
         else:
-            images, files = [], []
+            images, files, originals = [], [], {}
+        # Documents: an attached file is kept for an hour so "now fix the
+        # second paragraph" can edit it without it being sent again; a
+        # request for a file gets the how-to note.
+        doc_key = (str(channel_id), str(member.id))
+        if files:
+            _remember_documents(doc_key, files, originals)
+        elif not spoken and doc_output.wants_document(content):
+            earlier = _recent_documents(doc_key)
+            if earlier is not None:
+                files = list(earlier["files"])
+                logger.info("files: re-reading %d document(s) %s sent "
+                            "earlier", len(files), speaker)
+        documents_note = bool(
+            not spoken and adapter.capabilities().file_upload
+            and (files or doc_output.wants_document(content)))
 
         reply_kwargs = dict(
             user_id=member.id, speaker=speaker, user_content=content,
@@ -2692,6 +2885,7 @@ def main() -> int:
             channel_name=channel_name,
             guild_id=guild.id if guild else None,
             images=images, files=files, spoken=spoken,
+            documents_note=documents_note,
         )
         if set_aside is not None:
             reply_kwargs["set_aside"] = command_help.set_aside(

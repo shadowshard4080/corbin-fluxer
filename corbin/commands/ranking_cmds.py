@@ -7,7 +7,10 @@ naturally, and which also works as `!leaderboard 2`.
 
 from __future__ import annotations
 
+import logging
 import os
+import re
+import time
 
 from typing import Any, Optional
 
@@ -17,6 +20,8 @@ from ..core.ranking import (MAX_TIER_LEVEL, RankRoles, next_role,
                             xp_for_level)
 from ..core.registry import Param, Risk, command
 from ..identity import NAME
+
+logger = logging.getLogger("corbin.ranking_cmds")
 
 PAGE_SIZE = 10
 
@@ -267,27 +272,328 @@ def _ranking_phrase(args) -> str:
 async def setup_ranking(ctx: CommandContext, enabled: bool,
                         channel: Optional[str] = None) -> str:
     settings = ctx.extras["settings"]
-    settings.set_ranking(ctx.guild_id, enabled)
     if not enabled:
+        settings.set_ranking(ctx.guild_id, enabled)
         return "Ranking is off. Existing XP is kept, I just won't add to it."
 
-    # "in this channel" is the common phrasing, so an unresolved reference
-    # means here rather than nowhere. A name like "ranking" is resolved
-    # through the guild's channel index; anything unrecognised falls back to
-    # the current channel rather than writing a broken id.
-    target = _resolve_channel(ctx, channel) or ctx.channel.id
-    settings.set_ranking_channel(ctx.guild_id, target)
+    gid = str(ctx.guild_id)
+    roles = _rank_roles(ctx)
+    # "in this channel" is the common phrasing, so a named channel that
+    # can't be resolved means here rather than nowhere.
+    target = (_resolve_channel(ctx, channel) or ctx.channel.id) \
+        if channel else None
+    stored = settings.ranking_channel(gid)
+    # Owner, 2026-11-17: ask where level-ups go (an existing channel or
+    # a new one) and which roles, before making anything. A server that
+    # already had ranking keeps its channel and roles: re-enabling it
+    # used to move level-ups to wherever it was typed.
+    ask_channel = target is None and not stored
+    ask_roles = roles.never_set_up(gid)
+    if not ask_channel and not ask_roles:
+        return await finish_setup(ctx.extras, gid, target or stored)
+    questions = ctx.extras.get("ranking_questions")
+    if questions is None:
+        raise RuntimeError("ranking_questions is missing from extras; "
+                           "the setup questions can't be answered")
+    questions[(str(ctx.channel.id), str(ctx.invoker.id))] = {
+        "guild": gid, "stage": "channel" if ask_channel else "roles",
+        "channel": target, "make": False, "here": str(ctx.channel.id),
+        "deadline": time.monotonic() + SETUP_QUESTION_TTL}
+    logger.info("ranking setup in %s: asking about the %s", gid,
+                "channel" if ask_channel else "roles")
+    return CHANNEL_QUESTION if ask_channel else roles_question()
 
-    adapter = ctx.extras["adapter"]
-    tiers = _rank_roles(ctx).tiers(ctx.guild_id)
-    created, problems = await adapter.ensure_rank_roles(ctx.guild_id, tiers)
-    note = f" {len(created)} rank roles are ready."
-    if problems:
-        note = (f" I could only set up {len(created)} of {len(tiers)} "
-                f"rank roles: {problems[0]}. I probably need Manage Roles, "
-                "and my own role has to sit above the ones I create.")
+
+# -- the setup questions -------------------------------------------------------
+
+#: How long the setup questions stay answerable.
+SETUP_QUESTION_TTL = 600.0
+LEVEL_UP_CHANNEL = "level-ups"
+LEVEL_UP_TOPIC = f"Level-ups and new rank roles, posted by {NAME}."
+#: Seconds between one member's messages in a #level-ups he makes.
+LEVEL_UP_SLOWMODE = 30
+#: What @everyone gets there: read, post, react with any emoji.
+MEMBER_ALLOW = (Perm.VIEW_CHANNEL | Perm.READ_MESSAGE_HISTORY
+                | Perm.SEND_MESSAGES | Perm.ADD_REACTIONS
+                | Perm.USE_EXTERNAL_EMOJIS)
+
+CHANNEL_QUESTION = (
+    "Where should I post level-ups? Name a channel that's already here "
+    "(like #general), say **here** for this one, or say **make one** and "
+    f"I'll create #{LEVEL_UP_CHANNEL}. Say cancel to stop.")
+
+
+def roles_question() -> str:
+    from ..core.ranking import STANDARD_TIERS
+    listing = "\n".join(f"• Level {lvl}: {name}"
+                        for lvl, (name, _c) in sorted(STANDARD_TIERS.items()))
+    return ("Which rank roles should I make? Say **default** for these:\n"
+            f"{listing}\n"
+            "Or list your own, like `1 Rookie, 10 Regular, 50 Veteran "
+            "#c0c0c0` (a colour is optional), or say **no roles** for XP "
+            "and levels without roles. Say cancel to stop.")
+
+
+#: "<name>, make one" / "@<name> default": the bot's name in front
+#: isn't part of the answer.
+_ADDRESS = re.compile(rf"^\s*(?:@?{re.escape(NAME)}\b[\s,:!-]*"
+                      r"|<@!?\d+>[\s,:]*)", re.IGNORECASE)
+_CANCEL = re.compile(r"^\s*(cancel|never\s*mind|nevermind|stop|forget it)\b",
+                     re.IGNORECASE)
+_MAKE = re.compile(
+    r"^\s*(?:please\s+)?(?:make|create|new)\b(?:\s+(?:a|one|it|me))?"
+    r"(?:\s+(?:new\s+)?(?:one|channel|#?level[\s-]?ups?))?\s*(?:please)?"
+    r"[.!]*\s*$"
+    r"|^\s*(?:a\s+)?new\s+(?:one|channel)\b", re.IGNORECASE)
+_DEFAULT = re.compile(
+    r"^\s*(?:use\s+)?(?:the\s+)?(?:defaults?|standard)(?:\s+(?:ones|roles|"
+    r"list|please))?[.!]*\s*$"
+    r"|^\s*(?:yes|yeah|yep|sure|ok(?:ay)?|those|sounds good|go with "
+    r"(?:those|the defaults?))[.!]*\s*$", re.IGNORECASE)
+_NO_ROLES = re.compile(r"^\s*(?:no(?:ne)?|without)\s*(?:rank\s+)?roles?"
+                       r"[.!]*\s*$|^\s*none[.!]*\s*$", re.IGNORECASE)
+_OWN = re.compile(r"\b(?:my|our)\s+own\b|\bcustom\b", re.IGNORECASE)
+_TIER = re.compile(
+    r"(?:level\s*)?(\d{1,4})\s*[:=.)\-–]?\s*([^,;\n#]+?)\s*"
+    r"(#[0-9a-fA-F]{6})?\s*(?=[,;\n]|$)", re.IGNORECASE)
+
+
+def parse_tiers(text: str) -> tuple[dict, list[str]]:
+    """``{level: (name, colour)}`` and problems, from "1 Rookie, 10 Pup
+    #ffaa00". Each comma, semicolon or line is one tier."""
+    from ..core.ranking import DEFAULT_COLOUR
+    body = _OWN.sub(" ", text or "")
+    body = re.sub(r"^\s*[:\-–]+|\b(?:rank\s+)?roles?\s*:", " ", body)
+    tiers, problems = {}, []
+    for part in re.split(r"[,;\n]+", body):
+        part = part.strip().strip(".")
+        if not part:
+            continue
+        m = _TIER.fullmatch(part)
+        if not m:
+            problems.append(f"“{part}” needs a level and a name, like "
+                            "`10 Regular`")
+            continue
+        level, name, colour = int(m.group(1)), m.group(2).strip(), m.group(3)
+        if level in tiers:
+            problems.append(f"level {level} is in the list twice")
+            continue
+        tiers[level] = (name, int(colour[1:], 16) if colour
+                        else DEFAULT_COLOUR)
+    return tiers, problems
+
+
+def _can_make_channels(member: Any) -> bool:
+    if getattr(member, "is_guild_owner", False):
+        return True
+    from ..core.permissions import resolve
+    perms = resolve((getattr(r, "permissions", 0)
+                     for r in getattr(member, "roles", ()) or ()))
+    return bool(perms & (Perm.MANAGE_CHANNELS | Perm.ADMINISTRATOR))
+
+
+async def answer_setup(questions: dict, extras: Any, *, guild_id: Optional[str],
+                       channel_id: str, member: Any, content: str,
+                       mentioned: Any, index: Any) -> Optional[str]:
+    """The reply to an answer to a setup question, or None when this
+    message isn't one (it's then handled as normal and the question
+    stays open until it expires)."""
+    key = (str(channel_id), str(member.id))
+    asked = questions.get(key)
+    if asked is None:
+        return None
+    if time.monotonic() > asked["deadline"] or \
+            str(asked["guild"]) != str(guild_id):
+        questions.pop(key, None)
+        return None
+    content = _ADDRESS.sub("", content or "")
+    if _CANCEL.match(content):
+        questions.pop(key, None)
+        return "Okay, dropped it. Ranking is still off and nothing changed."
+
+    gid = str(guild_id)
+    roles = extras.get("rank_roles") or RankRoles(extras["settings"])
+    if asked["stage"] == "channel":
+        if _MAKE.match(content or ""):
+            if not _can_make_channels(member):
+                return ("Making a channel needs Manage Channels, which you "
+                        "don't have. Name a channel that's already here "
+                        "instead, or say cancel.")
+            asked["make"] = True
+        else:
+            from .config_cmds import match_general_answer
+            target = match_general_answer(content, mentioned or {},
+                                          index or {}, asked["here"])
+            if not target:
+                return None
+            asked["channel"] = target
+        if roles.never_set_up(gid):
+            asked["stage"] = "roles"
+            asked["deadline"] = time.monotonic() + SETUP_QUESTION_TTL
+            return roles_question()
+        return await _finish_and_close(questions, key, extras, gid, asked)
+
+    # stage == "roles"
+    if _DEFAULT.match(content or ""):
+        choice: Any = "default"
+    elif _NO_ROLES.match(content or ""):
+        choice = {}
+    else:
+        tiers, problems = parse_tiers(content)
+        if not tiers and not problems:
+            if _OWN.search(content or ""):
+                return ("Go ahead: list them like `1 Rookie, 10 Regular, "
+                        "50 Veteran #c0c0c0`, or say cancel.")
+            return None
+        if not tiers or problems:
+            # A message that's mostly not tiers is chat, not an answer.
+            if not tiers and not _OWN.search(content or ""):
+                return None
+            return ("I couldn't use that:\n- " + "\n- ".join(problems)
+                    + "\n\nTry the whole list again, or say cancel.")
+        try:
+            roles.replace_all(gid, tiers)
+        except ValueError as exc:
+            return f"That won't work: {exc}. Try again, or say cancel."
+        choice = "own"
+    if choice == "default":
+        roles.use_defaults(gid)
+    elif choice == {}:
+        roles.replace_all(gid, {})
+    return await _finish_and_close(questions, key, extras, gid, asked)
+
+
+async def _finish_and_close(questions: dict, key: tuple, extras: Any,
+                            gid: str, asked: dict) -> str:
+    """Finish, and close the question only once that worked: a crash
+    in between (live 2026-11-18, ``KeyError: 'adapter'``) used to eat
+    the question, so answering again did nothing."""
+    reply = await finish_setup(extras, gid, asked.get("channel"),
+                               make=asked["make"], near=asked["here"])
+    questions.pop(key, None)
+    return reply
+
+
+async def finish_setup(extras: Any, gid: str, channel_id: Optional[str], *,
+                       make: bool = False, near: Optional[str] = None) -> str:
+    """Make the channel if asked, switch ranking on, create the roles."""
+    settings = extras["settings"]
+    adapter = extras["adapter"]
+    roles = extras.get("rank_roles") or RankRoles(settings)
+    note = ""
+    if make:
+        channel_id, created, problems = await ensure_level_up_channel(
+            adapter, gid, near)
+        if channel_id is None:
+            return (f"I couldn't make #{LEVEL_UP_CHANNEL}: {problems[0]}. I "
+                    "need Manage Channels. Ranking is still off; name an "
+                    "existing channel with “enable ranking in #channel”.")
+        if not created:
+            note += f" #{LEVEL_UP_CHANNEL} was already here, so I used it."
+        elif problems:
+            note += f" (#{LEVEL_UP_CHANNEL} is made, but I {problems[0]}.)"
+    settings.set_ranking(gid, True)
+    settings.set_ranking_channel(gid, channel_id)
+    tiers = roles.tiers(gid)
+    if tiers:
+        created_roles, problems = await adapter.ensure_rank_roles(gid, tiers)
+        if problems:
+            note += (f" I could only set up {len(created_roles)} of "
+                     f"{len(tiers)} rank roles: {problems[0]}. I probably "
+                     "need Manage Roles, and my own role has to sit above "
+                     "the ones I create.")
+        else:
+            note += f" {len(created_roles)} rank roles are ready."
+    else:
+        note += (" No rank roles: say “make level 10 give the role X” to "
+                 "add one.")
+    logger.info("ranking on in %s: level-ups in %s, %d rank role(s)", gid,
+                channel_id, len(tiers))
     return (f"Ranking is on. I'll count XP from messages and post level-ups "
-            f"in <#{target}>.{note} Level 1 starts at 100 XP.")
+            f"in <#{channel_id}>.{note} Level 1 starts at 100 XP.")
+
+
+async def _set_slowmode(http: Any, channel_id: str, seconds: int) -> bool:
+    """``rate_limit_per_user`` on a channel. Through the client's own
+    ``request`` first (a plain PATCH, nothing for the SDK to drop), then
+    its ``modify_channel`` binding."""
+    request = getattr(http, "request", None)
+    route = getattr(http, "_route", None)
+    if request is not None and route is not None:
+        try:
+            await request(route("PATCH", "/channels/{channel_id}",
+                                channel_id=channel_id),
+                          json={"rate_limit_per_user": int(seconds)})
+            return True
+        except Exception:
+            logger.info("slowmode PATCH refused for %s; trying the binding",
+                        channel_id, exc_info=True)
+    try:
+        await http.modify_channel(channel_id, rate_limit_per_user=int(seconds))
+        return True
+    except Exception:
+        logger.warning("ranking: couldn't set slowmode on %s", channel_id,
+                       exc_info=True)
+        return False
+
+
+async def ensure_level_up_channel(adapter: Any, guild_id: str,
+                                  near: Optional[str]
+                                  ) -> tuple[Optional[str], bool, list[str]]:
+    """Create or adopt #level-ups: ``(id, created, problems)``. An
+    existing one is used as it is. A new one goes in the same category
+    as the channel the setup was asked in; everyone may post (30-second
+    slowmode) and react."""
+    http = adapter._rest()
+    try:
+        channels = list(await http.get_guild_channels(guild_id) or [])
+    except Exception as exc:
+        return None, False, [f"couldn't list the channels ({exc})"]
+    for raw in channels:
+        if str(raw.get("name") or "").lower() == LEVEL_UP_CHANNEL \
+                and int(raw.get("type") or 0) == 0:
+            return str(raw["id"]), False, []
+    parent = next((str(c["parent_id"]) for c in channels
+                   if str(c.get("id")) == str(near) and c.get("parent_id")),
+                  None)
+    try:
+        made = await http.create_guild_channel(
+            guild_id, name=LEVEL_UP_CHANNEL, type=0, topic=LEVEL_UP_TOPIC,
+            parent_id=parent)
+        channel_id = str(made.get("id"))
+    except Exception as exc:
+        return None, False, [str(exc)]
+    problems: list[str] = []
+    # Owner, 2026-11-18: members post here too (congratulations), with a
+    # 30-second slowmode, and can react with any emoji.
+    try:
+        await http.edit_channel_permissions(
+            channel_id, guild_id, allow=str(int(MEMBER_ALLOW)), deny="0",
+            type=0)
+    except Exception as exc:
+        problems.append(f"couldn't open it to everyone ({exc})")
+    if not await _set_slowmode(http, channel_id, LEVEL_UP_SLOWMODE):
+        problems.append(f"couldn't set the {LEVEL_UP_SLOWMODE}-second "
+                        "slowmode; set it in the channel's settings")
+    # His own access. Live 2026-11-18 he made the channel and then
+    # couldn't post in it: the member overwrite alone didn't take, and
+    # its failure only reached an INFO line. Now the member overwrite
+    # AND one on each of his roles (role overwrites are what the
+    # @everyone deny above proves work), and a reply that says so if
+    # neither went through.
+    from ..core.channel_access import grant_self
+    from ..core.reaction_roles import BOT_ALLOW
+
+    # Manage Messages: what lets a bot past slowmode on Discord, so two
+    # level-ups in 30 s both post. Unverified on Fluxer.
+    granted = await grant_self(adapter, http, guild_id, channel_id,
+                               BOT_ALLOW | Perm.MANAGE_MESSAGES)
+    if not granted:
+        problems.append("couldn't give myself permission to post in it; "
+                        "give my role Send Messages there")
+    logger.info("ranking: made #%s (%s) in %s", LEVEL_UP_CHANNEL,
+                channel_id, guild_id)
+    return channel_id, True, problems
 
 
 # -- customising the rank roles ----------------------------------------------

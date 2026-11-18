@@ -50,6 +50,7 @@ CATEGORIES = {
     "music_cmds": "Music",
     "radio_cmds": "Radio",
     "reaction_role_cmds": "Reaction roles",
+    "event_cmds": "Server events calendar",
     "ranking_cmds": "Ranking and XP",
     "reminder_cmds": "Reminders",
     "scheduled_cmds": "Scheduled posts",
@@ -499,6 +500,8 @@ def set_aside_block(detail: str) -> str:
         "your real commands, but not as a request to run it right now, so "
         "nothing ran:\n"
         f"{detail}\n"
+        "Never say or imply that you did it: it did not run, and "
+        "nothing was saved or changed. "
         "Never claim you can't do this, or that you're text-only. The "
         "match may be wrong: if the message is really about something "
         "else (a question, homework, chat), just answer that and don't "

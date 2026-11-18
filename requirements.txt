@@ -20,5 +20,9 @@ python-dotenv
 # Optional: only when DATA_KEY / DATA_KEY_FILE is set (encryption at rest).
 # cryptography
 
+# Optional: making PDFs (fpdf2) and reading attached ones (pypdf).
+# fpdf2
+# pypdf
+
 # Only for tools/build_gill_db.py (optional bible commentary):
 # beautifulsoup4
